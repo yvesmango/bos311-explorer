@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Iterable
@@ -46,6 +47,18 @@ DEFAULT_CKAN_SQL_ENDPOINT = "https://data.boston.gov/api/3/action/datastore_sear
 DEFAULT_CKAN_RESOURCE_ID = "1a0b420d-99f1-4887-9851-990b2a5a6e17"
 DEFAULT_TARGET_YEAR = 2026
 DEFAULT_BATCH_SIZE = 10000
+NEW_SYSTEM_HINTS = {
+    "case id",
+    "open date",
+    "close date",
+    "target close date",
+    "case topic",
+    "service name",
+    "assigned team",
+    "closure comments",
+    "full street address",
+    "street number",
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,37 @@ class RunSummary:
     successful_rows: int
     successful_batches: int
     failed_batches: int
+
+
+@dataclass(frozen=True)
+class NormalizedTicket:
+    case_enquiry_id: int
+    source_system: str
+    subject: str | None
+    description: str | None
+    case_topic: str | None
+    department_name: str | None
+    category_name: str | None
+    case_status: str | None
+    street_name: str | None
+    neighborhood: str | None
+    ward: str | None
+    precinct: str | None
+    city_council_district: str | None
+    source: str | None
+    request_type: str | None
+    service_name: str | None
+    assigned_team: str | None
+    closure_comments: str | None
+    street_number: str | None
+    full_street_address: str | None
+    open_dt: datetime | None
+    closed_dt: datetime | None
+    sla_target_dt: datetime | None
+    due_date: datetime | None
+    on_time: bool | None
+    latitude: float | None
+    longitude: float | None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,6 +205,32 @@ def build_http_session() -> requests.Session:
     return session
 
 
+def normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def build_payload_index(ticket: dict[str, Any]) -> dict[str, Any]:
+    return {normalize_key(str(key)): value for key, value in ticket.items()}
+
+
+def payload_value(index: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = index.get(normalize_key(name))
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def is_new_system_ticket(index: dict[str, Any]) -> bool:
+    return any(normalize_key(hint) in index for hint in NEW_SYSTEM_HINTS)
+
+
+def parse_case_enquiry_id(value: Any) -> int:
+    if value in (None, ""):
+        raise ValueError("CKAN ticket is missing case_enquiry_id.")
+    return int(value)
+
+
 def timestamp_literal(value: datetime | None) -> str:
     if value is None:
         return "TIMESTAMPTZ 'infinity'"
@@ -227,6 +297,124 @@ def parse_optional_int(value: str | None) -> int | None:
     if not stripped:
         return None
     return int(stripped)
+
+
+def normalize_case_status(value: Any) -> str | None:
+    text = normalize_text(value)
+    if text is None:
+        return None
+    lowered = text.lower()
+    if lowered in {"open", "in progress"}:
+        return "open"
+    if lowered == "closed":
+        return "closed"
+    return lowered
+
+
+def normalize_on_time(value: Any) -> bool | None:
+    text = normalize_text(value)
+    if text is None:
+        return to_bool(value)
+    lowered = text.lower()
+    if lowered == "ontime":
+        return True
+    if lowered == "overdue":
+        return False
+    return to_bool(value)
+
+
+def normalize_report_source(value: Any) -> str | None:
+    text = normalize_text(value)
+    if text is None:
+        return None
+    lowered = text.lower()
+    if lowered == "constituent call":
+        return "call"
+    if lowered == "call":
+        return "call"
+    return lowered
+
+
+def translate_ticket(ticket: dict[str, Any]) -> NormalizedTicket:
+    index = build_payload_index(ticket)
+    source_system = "new_boston_311" if is_new_system_ticket(index) else "legacy_boston_311"
+
+    case_enquiry_id = parse_case_enquiry_id(
+        payload_value(index, "case_enquiry_id", "case id")
+    )
+
+    subject = normalize_text(
+        payload_value(
+            index,
+            "subject",
+            "assigned department",
+            "department",
+        )
+    )
+    description = normalize_text(
+        payload_value(
+            index,
+            "reason",
+            "description",
+        )
+    )
+    case_topic = normalize_text(
+        payload_value(
+            index,
+            "case_topic",
+            "case topic",
+            "case_title",
+            "type",
+        )
+    ) or description
+
+    if subject is None:
+        subject = normalize_text(
+            payload_value(
+                index,
+                "assigned department",
+                "subject",
+                "department",
+                "service name",
+            )
+        )
+
+    department_name = subject
+    category_name = case_topic
+
+    return NormalizedTicket(
+        case_enquiry_id=case_enquiry_id,
+        source_system=source_system,
+        subject=subject,
+        description=description,
+        case_topic=case_topic,
+        department_name=department_name,
+        category_name=category_name,
+        case_status=normalize_case_status(payload_value(index, "case_status", "case status")),
+        street_name=normalize_text(
+            payload_value(index, "street_name", "location_street_name", "street name")
+        ),
+        neighborhood=normalize_text(payload_value(index, "neighborhood")),
+        ward=normalize_text(payload_value(index, "ward")),
+        precinct=normalize_text(payload_value(index, "precinct")),
+        city_council_district=normalize_text(payload_value(index, "city_council_district", "city council district")),
+        source=normalize_report_source(payload_value(index, "source", "report source")),
+        request_type=normalize_text(payload_value(index, "type", "service name")),
+        service_name=normalize_text(payload_value(index, "service name")) if source_system == "new_boston_311" else None,
+        assigned_team=normalize_text(payload_value(index, "assigned team")) if source_system == "new_boston_311" else None,
+        closure_comments=normalize_text(payload_value(index, "closure comments")) if source_system == "new_boston_311" else None,
+        street_number=normalize_text(payload_value(index, "street number")) if source_system == "new_boston_311" else None,
+        full_street_address=normalize_text(
+            payload_value(index, "full street address", "location")
+        ) if source_system == "new_boston_311" else None,
+        open_dt=to_datetime(payload_value(index, "open_dt", "open date")),
+        closed_dt=to_datetime(payload_value(index, "closed_dt", "close date")),
+        sla_target_dt=to_datetime(payload_value(index, "sla_target_dt", "target close date")),
+        due_date=to_datetime(payload_value(index, "due_date", "due date")),
+        on_time=normalize_on_time(payload_value(index, "on_time", "on time?")),
+        latitude=to_float(payload_value(index, "latitude", "latitude(y)", "latitude y")),
+        longitude=to_float(payload_value(index, "longitude", "longitude(x)", "longitude x")),
+    )
 
 
 def to_datetime(value: Any) -> datetime | None:
@@ -337,33 +525,46 @@ def upsert_lookup(cursor, table: str, name: str, extra: dict[str, Any] | None = 
     return row[0] if row else None
 
 
-def upsert_ticket(cursor, ticket: dict[str, Any], raw_payload_id: int, department_id: int | None, category_id: int | None) -> None:
-    latitude, longitude = make_geo_point_sql(ticket.get("latitude"), ticket.get("longitude"))
+def upsert_ticket(
+    cursor,
+    ticket: NormalizedTicket,
+    raw_payload_id: int,
+    department_id: int | None,
+    category_id: int | None,
+) -> None:
+    latitude, longitude = make_geo_point_sql(ticket.latitude, ticket.longitude)
     geo_point_sql = (
         "ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography" if latitude is not None and longitude is not None else "NULL"
     )
     params: list[Any] = [
-        ticket.get("case_enquiry_id"),
+        ticket.case_enquiry_id,
         raw_payload_id,
         department_id,
         category_id,
-        normalize_text(ticket.get("case_status")),
-        normalize_text(ticket.get("street_name")),
-        normalize_text(ticket.get("neighborhood")),
-        normalize_text(ticket.get("ward")),
-        normalize_text(ticket.get("precinct")),
-        normalize_text(ticket.get("city_council_district")),
-        normalize_text(ticket.get("source")),
-        normalize_text(ticket.get("description")),
-        normalize_text(ticket.get("subject")),
-        normalize_text(ticket.get("request_type")),
-        to_datetime(ticket.get("open_dt")),
-        to_datetime(ticket.get("closed_dt")),
-        to_datetime(ticket.get("sla_target_dt")),
-        to_datetime(ticket.get("due_date")),
-        to_bool(ticket.get("on_time")),
+        ticket.case_status,
+        ticket.street_name,
+        ticket.neighborhood,
+        ticket.ward,
+        ticket.precinct,
+        ticket.city_council_district,
+        ticket.source,
+        ticket.description,
+        ticket.subject,
+        ticket.request_type,
+        ticket.open_dt,
+        ticket.closed_dt,
+        ticket.sla_target_dt,
+        ticket.due_date,
+        ticket.on_time,
         latitude,
         longitude,
+        ticket.source_system,
+        ticket.case_topic,
+        ticket.service_name,
+        ticket.assigned_team,
+        ticket.closure_comments,
+        ticket.street_number,
+        ticket.full_street_address,
     ]
     if latitude is not None and longitude is not None:
         params.extend([longitude, latitude])
@@ -391,10 +592,18 @@ def upsert_ticket(cursor, ticket: dict[str, Any], raw_payload_id: int, departmen
             on_time,
             latitude,
             longitude,
+            source_system,
+            case_topic,
+            service_name,
+            assigned_team,
+            closure_comments,
+            street_number,
+            full_street_address,
             geo_point
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
             {geo_point_sql}
         )
         ON CONFLICT (case_enquiry_id)
@@ -419,15 +628,19 @@ def upsert_ticket(cursor, ticket: dict[str, Any], raw_payload_id: int, departmen
             on_time = EXCLUDED.on_time,
             latitude = EXCLUDED.latitude,
             longitude = EXCLUDED.longitude,
-            geo_point = EXCLUDED.geo_point
+            geo_point = EXCLUDED.geo_point,
+            source_system = EXCLUDED.source_system,
+            case_topic = EXCLUDED.case_topic,
+            service_name = EXCLUDED.service_name,
+            assigned_team = EXCLUDED.assigned_team,
+            closure_comments = EXCLUDED.closure_comments,
+            street_number = EXCLUDED.street_number,
+            full_street_address = EXCLUDED.full_street_address
     """
     cursor.execute(sql, params)
 
 
-def load_payload(cursor, ticket: dict[str, Any]) -> int:
-    case_enquiry_id = ticket.get("case_enquiry_id")
-    if case_enquiry_id in (None, ""):
-        raise ValueError("CKAN ticket is missing case_enquiry_id.")
+def load_payload(cursor, ticket: NormalizedTicket, raw_ticket: dict[str, Any]) -> int:
     cursor.execute(
         """
         INSERT INTO raw_311_tickets (case_enquiry_id, payload)
@@ -436,7 +649,7 @@ def load_payload(cursor, ticket: dict[str, Any]) -> int:
         DO UPDATE SET payload = EXCLUDED.payload
         RETURNING id
         """,
-        (int(case_enquiry_id), Json(ticket)),
+        (ticket.case_enquiry_id, Json(raw_ticket)),
     )
     row = cursor.fetchone()
     if not row:
@@ -447,22 +660,22 @@ def load_payload(cursor, ticket: dict[str, Any]) -> int:
 def ingest_batch(cursor, rows: Iterable[dict[str, Any]]) -> int:
     ingested_count = 0
     for ticket in rows:
-        case_enquiry_id = ticket.get("case_enquiry_id")
-        if case_enquiry_id in (None, ""):
-            raise ValueError("CKAN ticket is missing case_enquiry_id.")
-        raw_payload_id = load_payload(cursor, ticket)
-        department_name = normalize_text(ticket.get("department"))
-        category_name = normalize_text(ticket.get("case_title") or ticket.get("subject"))
-        department_id = upsert_lookup(cursor, "departments", department_name) if department_name else None
+        normalized_ticket = translate_ticket(ticket)
+        raw_payload_id = load_payload(cursor, normalized_ticket, ticket)
+        department_id = (
+            upsert_lookup(cursor, "departments", normalized_ticket.department_name)
+            if normalized_ticket.department_name
+            else None
+        )
         category_id = None
-        if category_name:
+        if normalized_ticket.category_name:
             category_id = upsert_lookup(
                 cursor,
                 "categories",
-                category_name,
+                normalized_ticket.category_name,
                 extra={"department_id": department_id} if department_id else None,
             )
-        upsert_ticket(cursor, ticket, raw_payload_id, department_id, category_id)
+        upsert_ticket(cursor, normalized_ticket, raw_payload_id, department_id, category_id)
         ingested_count += 1
     return ingested_count
 

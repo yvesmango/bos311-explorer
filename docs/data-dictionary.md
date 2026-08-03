@@ -27,5 +27,9 @@
 - `department_id`, `category_id`: normalized joins
 - `geo_point`: PostGIS point for map rendering and spatial analysis
 - `open_dt`, `closed_dt`, `sla_target_dt`, `due_date`: timeline fields
-- `description`: ticket narrative useful for map popups and issue context
+- `subject`: broad department or service area
+- `description`: legacy `reason` field, used as a fallback for issue context
+- `case_topic`: human-readable issue title, usually from legacy `case_title`
+- `source_system`: `legacy_boston_311` or `new_boston_311`
+- `service_name`, `assigned_team`, `closure_comments`, `street_number`, `full_street_address`: transition-era fields used for the newer vendor payloads
 - `on_time`: SLA compliance flag
