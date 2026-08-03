@@ -1,6 +1,6 @@
 """Ingest Boston 311 ticket data from CKAN into Supabase/PostgreSQL.
 
-The script ingests the full historical dataset in batches:
+The script ingests the target year dataset in batches:
 - raw CKAN payloads are stored for auditability
 - lookup tables are upserted by natural key
 - ticket rows are upserted by `case_enquiry_id`
@@ -13,6 +13,7 @@ Optional environment variables:
 - `CKAN_SQL_ENDPOINT`: override the Boston CKAN SQL endpoint
 - `CKAN_BASE_URL`: alternate Boston CKAN base URL used to derive the SQL endpoint
 - `CKAN_RESOURCE_ID`: override the CKAN datastore resource id
+- `INGESTION_TARGET_YEAR`: source year to ingest for the pilot (default: `2026`)
 - `INGESTION_BATCH_SIZE`: rows to fetch per CKAN batch
 - `INGESTION_MAX_RECORDS`: cap on total source rows traversed for testing
 """
@@ -43,6 +44,7 @@ from urllib3.util.retry import Retry
 LOGGER = logging.getLogger("bos311.ingest")
 DEFAULT_CKAN_SQL_ENDPOINT = "https://data.boston.gov/api/3/action/datastore_search_sql"
 DEFAULT_CKAN_RESOURCE_ID = "1a0b420d-99f1-4887-9851-990b2a5a6e17"
+DEFAULT_TARGET_YEAR = 2026
 DEFAULT_BATCH_SIZE = 10000
 
 
@@ -51,6 +53,7 @@ class IngestionConfig:
     database_url: str
     ckan_sql_endpoint: str
     ckan_resource_id: str
+    target_year: int
     batch_size: int
     max_records: int | None
     apply_schema: bool
@@ -83,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional cap on the total number of source rows traversed in a run.",
     )
     parser.add_argument(
+        "--target-year",
+        type=int,
+        default=None,
+        help="Source year to ingest for the pilot. Defaults to 2026.",
+    )
+    parser.add_argument(
         "--apply-schema",
         action="store_true",
         help="Apply sql/schema_v1.sql before ingesting.",
@@ -107,6 +116,12 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
         else:
             ckan_sql_endpoint = DEFAULT_CKAN_SQL_ENDPOINT
 
+    target_year = args.target_year
+    if target_year is None:
+        target_year = parse_optional_int(os.getenv("INGESTION_TARGET_YEAR")) or DEFAULT_TARGET_YEAR
+    if target_year < 2000:
+        raise RuntimeError("INGESTION_TARGET_YEAR must be a realistic four-digit year.")
+
     batch_size = args.batch_size
     if batch_size is None:
         batch_size = parse_optional_int(os.getenv("INGESTION_BATCH_SIZE")) or DEFAULT_BATCH_SIZE
@@ -123,6 +138,7 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
         database_url=database_url,
         ckan_sql_endpoint=ckan_sql_endpoint,
         ckan_resource_id=os.getenv("CKAN_RESOURCE_ID", DEFAULT_CKAN_RESOURCE_ID),
+        target_year=target_year,
         batch_size=batch_size,
         max_records=max_records,
         apply_schema=args.apply_schema,
@@ -152,23 +168,30 @@ def timestamp_literal(value: datetime | None) -> str:
     return f"TIMESTAMPTZ '{normalized}'"
 
 
+def year_bounds(target_year: int) -> tuple[str, str]:
+    start = datetime(target_year, 1, 1, tzinfo=timezone.utc).isoformat().replace("'", "''")
+    end = datetime(target_year + 1, 1, 1, tzinfo=timezone.utc).isoformat().replace("'", "''")
+    return start, end
+
+
 def build_sql_query(
     resource_id: str,
     limit: int,
-    cursor: tuple[datetime | None, int] | None,
+    target_year: int,
+    cursor: tuple[datetime, int] | None,
 ) -> str:
-    order_expr = "COALESCE(open_dt, 'infinity'::timestamptz)"
-    where_clause = ""
+    start_literal, end_literal = year_bounds(target_year)
+    where_clause = f"WHERE open_dt >= TIMESTAMPTZ '{start_literal}' AND open_dt < TIMESTAMPTZ '{end_literal}' "
     if cursor is not None:
         cursor_open_dt, cursor_case_enquiry_id = cursor
-        where_clause = (
-            "WHERE "
-            f"({order_expr}, case_enquiry_id) > ({timestamp_literal(cursor_open_dt)}, {cursor_case_enquiry_id}) "
+        where_clause += (
+            "AND "
+            f"(open_dt, case_enquiry_id) > ({timestamp_literal(cursor_open_dt)}, {cursor_case_enquiry_id}) "
         )
     return (
         f'SELECT * FROM "{resource_id}" '
         f"{where_clause}"
-        f"ORDER BY {order_expr} ASC, case_enquiry_id ASC "
+        "ORDER BY open_dt ASC, case_enquiry_id ASC "
         f"LIMIT {limit}"
     )
 
@@ -177,10 +200,11 @@ def extract_from_ckan(
     session: requests.Session,
     endpoint: str,
     resource_id: str,
+    target_year: int,
     limit: int,
-    cursor: tuple[datetime | None, int] | None,
+    cursor: tuple[datetime, int] | None,
 ) -> list[dict[str, Any]]:
-    query = build_sql_query(resource_id, limit, cursor)
+    query = build_sql_query(resource_id, limit, target_year, cursor)
     url = f"{endpoint}?{urlencode({'sql': query})}"
     LOGGER.info("Fetching CKAN batch", extra={"cursor": cursor, "limit": limit})
     response = session.get(url, timeout=120)
@@ -449,7 +473,7 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
     successful_batches = 0
     failed_batches = 0
     batch_number = 0
-    cursor: tuple[datetime | None, int] | None = None
+    cursor: tuple[datetime, int] | None = None
     current_batch_size = config.batch_size
 
     with psycopg2.connect(config.database_url) as conn:
@@ -475,6 +499,7 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                     session,
                     config.ckan_sql_endpoint,
                     config.ckan_resource_id,
+                    config.target_year,
                     batch_size,
                     cursor,
                 )
@@ -493,6 +518,8 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                 last_ticket = rows[-1]
                 last_open_dt = to_datetime(last_ticket.get("open_dt"))
                 last_case_enquiry_id = last_ticket.get("case_enquiry_id")
+                if last_open_dt is None:
+                    raise ValueError("CKAN batch ended without an open_dt within the pilot year.")
                 if last_case_enquiry_id in (None, ""):
                     raise ValueError("CKAN batch ended without a case_enquiry_id.")
                 cursor = (last_open_dt, int(last_case_enquiry_id))

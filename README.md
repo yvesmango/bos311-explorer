@@ -29,7 +29,9 @@ surface for maps, charts, tables, and future embeds.
 
 ## Ingestion
 
-Run a full historical ingestion with:
+The current pilot focuses on 2026 YTD only.
+
+Run the 2026 pilot ingestion with:
 
 ```bash
 uv run scripts/ingest_311.py
@@ -41,9 +43,11 @@ For a smaller test run, cap the source rows traversed:
 INGESTION_MAX_RECORDS=1000 uv run scripts/ingest_311.py
 ```
 
-The default batch size is `10000` rows. A full historical load is expected to
-take roughly 30 minutes for a dataset in the ~500,000 row range, depending on
-network and Supabase performance.
+To override the pilot year, set `INGESTION_TARGET_YEAR`, but we are keeping
+this project on 2026 until that slice is proven stable.
+
+The default batch size is `10000` rows. For larger future backfills, runtime
+will depend on network and Supabase performance.
 
 The fetcher uses keyset pagination plus retry/backoff so it is gentler on the
 CKAN source than deep `OFFSET` paging. If the source pushes back, the script
