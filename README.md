@@ -45,6 +45,10 @@ The default batch size is `10000` rows. A full historical load is expected to
 take roughly 30 minutes for a dataset in the ~500,000 row range, depending on
 network and Supabase performance.
 
+The fetcher uses keyset pagination plus retry/backoff so it is gentler on the
+CKAN source than deep `OFFSET` paging. If the source pushes back, the script
+will automatically shrink the batch size and keep moving forward.
+
 If an ingestion run is interrupted, simply rerun the script. The current design
 is idempotent thanks to `ON CONFLICT` upserts. A persisted resume marker is a
 future enhancement, not a requirement for correctness today.

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -131,10 +132,11 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
 def build_http_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(
-        total=5,
-        backoff_factor=0.5,
+        total=6,
+        backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -143,15 +145,31 @@ def build_http_session() -> requests.Session:
     return session
 
 
+def timestamp_literal(value: datetime | None) -> str:
+    if value is None:
+        return "TIMESTAMPTZ 'infinity'"
+    normalized = value.astimezone(timezone.utc).isoformat().replace("'", "''")
+    return f"TIMESTAMPTZ '{normalized}'"
+
+
 def build_sql_query(
     resource_id: str,
     limit: int,
-    offset: int,
+    cursor: tuple[datetime | None, int] | None,
 ) -> str:
+    order_expr = "COALESCE(open_dt, 'infinity'::timestamptz)"
+    where_clause = ""
+    if cursor is not None:
+        cursor_open_dt, cursor_case_enquiry_id = cursor
+        where_clause = (
+            "WHERE "
+            f"({order_expr}, case_enquiry_id) > ({timestamp_literal(cursor_open_dt)}, {cursor_case_enquiry_id}) "
+        )
     return (
         f'SELECT * FROM "{resource_id}" '
-        "ORDER BY open_dt ASC NULLS LAST, case_enquiry_id ASC "
-        f"LIMIT {limit} OFFSET {offset}"
+        f"{where_clause}"
+        f"ORDER BY {order_expr} ASC, case_enquiry_id ASC "
+        f"LIMIT {limit}"
     )
 
 
@@ -160,11 +178,11 @@ def extract_from_ckan(
     endpoint: str,
     resource_id: str,
     limit: int,
-    offset: int,
+    cursor: tuple[datetime | None, int] | None,
 ) -> list[dict[str, Any]]:
-    query = build_sql_query(resource_id, limit, offset)
+    query = build_sql_query(resource_id, limit, cursor)
     url = f"{endpoint}?{urlencode({'sql': query})}"
-    LOGGER.info("Fetching CKAN batch", extra={"offset": offset, "limit": limit})
+    LOGGER.info("Fetching CKAN batch", extra={"cursor": cursor, "limit": limit})
     response = session.get(url, timeout=120)
     response.raise_for_status()
     payload = response.json()
@@ -431,7 +449,8 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
     successful_batches = 0
     failed_batches = 0
     batch_number = 0
-    offset = 0
+    cursor: tuple[datetime | None, int] | None = None
+    current_batch_size = config.batch_size
 
     with psycopg2.connect(config.database_url) as conn:
         conn.autocommit = False
@@ -445,7 +464,7 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                 break
 
             remaining = None if config.max_records is None else config.max_records - source_rows_examined
-            batch_size = config.batch_size if remaining is None else min(config.batch_size, remaining)
+            batch_size = current_batch_size if remaining is None else min(current_batch_size, remaining)
             if batch_size <= 0:
                 break
 
@@ -457,7 +476,7 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                     config.ckan_sql_endpoint,
                     config.ckan_resource_id,
                     batch_size,
-                    offset,
+                    cursor,
                 )
                 batch_source_rows = len(rows)
                 source_rows_examined += batch_source_rows
@@ -470,6 +489,13 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                 conn.commit()
                 successful_rows += batch_success
                 successful_batches += 1
+                current_batch_size = config.batch_size
+                last_ticket = rows[-1]
+                last_open_dt = to_datetime(last_ticket.get("open_dt"))
+                last_case_enquiry_id = last_ticket.get("case_enquiry_id")
+                if last_case_enquiry_id in (None, ""):
+                    raise ValueError("CKAN batch ended without a case_enquiry_id.")
+                cursor = (last_open_dt, int(last_case_enquiry_id))
                 LOGGER.info(
                     "Fetched batch %s: %s records; committed %s records (running total %s).",
                     batch_number,
@@ -489,9 +515,17 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                 failed_batches += 1
                 if batch_source_rows == 0:
                     source_rows_examined += batch_size
-                LOGGER.exception("Batch %s failed at offset %s. Continuing with the next batch.", batch_number, offset)
-            finally:
-                offset += batch_size
+                LOGGER.exception("Batch %s failed at cursor %s. Continuing with the next batch.", batch_number, cursor)
+                if current_batch_size > 1000:
+                    next_batch_size = max(1000, current_batch_size // 2)
+                    if next_batch_size != current_batch_size:
+                        LOGGER.warning(
+                            "Reducing batch size after failure from %s to %s to ease source load.",
+                            current_batch_size,
+                            next_batch_size,
+                        )
+                    current_batch_size = next_batch_size
+                time.sleep(min(30, 2 ** min(failed_batches, 5)))
 
     return RunSummary(
         source_rows_examined=source_rows_examined,
