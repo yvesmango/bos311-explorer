@@ -670,10 +670,10 @@ def load_payload(cursor, ticket: NormalizedTicket, raw_ticket: dict[str, Any]) -
     return int(row[0])
 
 
-def ingest_batch(cursor, rows: Iterable[dict[str, Any]]) -> int:
+def ingest_batch(cursor, rows: Iterable[dict[str, Any]], source_system: str) -> int:
     ingested_count = 0
     for ticket in rows:
-        normalized_ticket = translate_ticket(ticket)
+        normalized_ticket = translate_ticket(ticket, source_system)
         raw_payload_id = load_payload(cursor, normalized_ticket, ticket)
         department_id = (
             upsert_lookup(cursor, "departments", normalized_ticket.department_name)
@@ -743,7 +743,7 @@ def ingest_resource(
                 break
 
             with conn.cursor() as db_cursor:
-                batch_success = ingest_batch(db_cursor, rows)
+                batch_success = ingest_batch(db_cursor, rows, resource.source_system)
             conn.commit()
             successful_rows += batch_success
             successful_batches += 1
