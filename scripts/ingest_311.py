@@ -693,14 +693,115 @@ def ingest_batch(cursor, rows: Iterable[dict[str, Any]]) -> int:
     return ingested_count
 
 
+def ingest_resource(
+    conn,
+    session: requests.Session,
+    ckan_sql_endpoint: str,
+    resource: SourceResource,
+    target_year: int,
+    batch_size: int,
+    max_records: int | None,
+    source_rows_examined: int,
+    successful_rows: int,
+    successful_batches: int,
+    failed_batches: int,
+    starting_batch_number: int,
+) -> tuple[int, int, int, int, int]:
+    cursor: tuple[datetime, int] | None = None
+    current_batch_size = batch_size
+    batch_number = starting_batch_number
+
+    while True:
+        if max_records is not None and source_rows_examined >= max_records:
+            LOGGER.info("Reached INGESTION_MAX_RECORDS cap", extra={"max_records": max_records})
+            break
+
+        remaining = None if max_records is None else max_records - source_rows_examined
+        current_limit = current_batch_size if remaining is None else min(current_batch_size, remaining)
+        if current_limit <= 0:
+            break
+
+        batch_number += 1
+        batch_source_rows = 0
+        try:
+            rows = extract_from_ckan(
+                session,
+                ckan_sql_endpoint,
+                resource.resource_id,
+                target_year,
+                current_limit,
+                cursor,
+            )
+            batch_source_rows = len(rows)
+            source_rows_examined += batch_source_rows
+            if not rows:
+                LOGGER.info(
+                    "No more CKAN records after batch %s for %s.",
+                    batch_number,
+                    resource.source_system,
+                )
+                break
+
+            with conn.cursor() as db_cursor:
+                batch_success = ingest_batch(db_cursor, rows)
+            conn.commit()
+            successful_rows += batch_success
+            successful_batches += 1
+            current_batch_size = batch_size
+            last_ticket = rows[-1]
+            last_open_dt = to_datetime(last_ticket.get("open_dt"))
+            last_case_enquiry_id = last_ticket.get("case_enquiry_id")
+            if last_open_dt is None:
+                raise ValueError("CKAN batch ended without an open_dt within the pilot year.")
+            if last_case_enquiry_id in (None, ""):
+                raise ValueError("CKAN batch ended without a case_enquiry_id.")
+            cursor = (last_open_dt, int(last_case_enquiry_id))
+            LOGGER.info(
+                "Fetched batch %s from %s: %s records; committed %s records (running total %s).",
+                batch_number,
+                resource.source_system,
+                batch_source_rows,
+                batch_success,
+                successful_rows,
+            )
+            if batch_source_rows < current_limit:
+                LOGGER.info(
+                    "Source returned a partial batch (%s of %s) for %s; ingestion is complete.",
+                    batch_source_rows,
+                    current_limit,
+                    resource.source_system,
+                )
+                break
+        except Exception:
+            conn.rollback()
+            failed_batches += 1
+            if batch_source_rows == 0:
+                source_rows_examined += current_limit
+            LOGGER.exception(
+                "Batch %s failed for %s at cursor %s. Continuing with the next batch.",
+                batch_number,
+                resource.source_system,
+                cursor,
+            )
+            if current_batch_size > 1000:
+                next_batch_size = max(1000, current_batch_size // 2)
+                if next_batch_size != current_batch_size:
+                    LOGGER.warning(
+                        "Reducing batch size after failure from %s to %s to ease source load.",
+                        current_batch_size,
+                        next_batch_size,
+                    )
+                current_batch_size = next_batch_size
+            time.sleep(min(30, 2 ** min(failed_batches, 5)))
+
+    return source_rows_examined, successful_rows, successful_batches, failed_batches, batch_number
+
+
 def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> RunSummary:
     source_rows_examined = 0
     successful_rows = 0
     successful_batches = 0
     failed_batches = 0
-    batch_number = 0
-    cursor: tuple[datetime, int] | None = None
-    current_batch_size = config.batch_size
 
     with psycopg2.connect(config.database_url) as conn:
         conn.autocommit = False
@@ -708,77 +809,33 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
             execute_schema(conn)
             conn.commit()
 
-        while True:
-            if config.max_records is not None and source_rows_examined >= config.max_records:
-                LOGGER.info("Reached INGESTION_MAX_RECORDS cap", extra={"max_records": config.max_records})
-                break
-
-            remaining = None if config.max_records is None else config.max_records - source_rows_examined
-            batch_size = current_batch_size if remaining is None else min(current_batch_size, remaining)
-            if batch_size <= 0:
-                break
-
-            batch_number += 1
-            batch_source_rows = 0
-            try:
-                rows = extract_from_ckan(
-                    session,
-                    config.ckan_sql_endpoint,
-                    config.ckan_resource_id,
-                    config.target_year,
-                    batch_size,
-                    cursor,
-                )
-                batch_source_rows = len(rows)
-                source_rows_examined += batch_source_rows
-                if not rows:
-                    LOGGER.info("No more CKAN records after batch %s.", batch_number)
-                    break
-
-                with conn.cursor() as cursor:
-                    batch_success = ingest_batch(cursor, rows)
-                conn.commit()
-                successful_rows += batch_success
-                successful_batches += 1
-                current_batch_size = config.batch_size
-                last_ticket = rows[-1]
-                last_open_dt = to_datetime(last_ticket.get("open_dt"))
-                last_case_enquiry_id = last_ticket.get("case_enquiry_id")
-                if last_open_dt is None:
-                    raise ValueError("CKAN batch ended without an open_dt within the pilot year.")
-                if last_case_enquiry_id in (None, ""):
-                    raise ValueError("CKAN batch ended without a case_enquiry_id.")
-                cursor = (last_open_dt, int(last_case_enquiry_id))
-                LOGGER.info(
-                    "Fetched batch %s: %s records; committed %s records (running total %s).",
-                    batch_number,
-                    batch_source_rows,
-                    batch_success,
-                    successful_rows,
-                )
-                if batch_source_rows < batch_size:
-                    LOGGER.info(
-                        "Source returned a partial batch (%s of %s); ingestion is complete.",
-                        batch_source_rows,
-                        batch_size,
-                    )
-                    break
-            except Exception:
-                conn.rollback()
-                failed_batches += 1
-                if batch_source_rows == 0:
-                    source_rows_examined += batch_size
-                LOGGER.exception("Batch %s failed at cursor %s. Continuing with the next batch.", batch_number, cursor)
-                if current_batch_size > 1000:
-                    next_batch_size = max(1000, current_batch_size // 2)
-                    if next_batch_size != current_batch_size:
-                        LOGGER.warning(
-                            "Reducing batch size after failure from %s to %s to ease source load.",
-                            current_batch_size,
-                            next_batch_size,
-                        )
-                    current_batch_size = next_batch_size
-                time.sleep(min(30, 2 ** min(failed_batches, 5)))
+        batch_number = 0
+        for resource in config.source_resources:
+            LOGGER.info(
+                "Starting CKAN resource %s for %s.",
+                resource.resource_id,
+                resource.source_system,
+            )
+            (
+                source_rows_examined,
+                successful_rows,
+                successful_batches,
+                failed_batches,
+                batch_number,
+            ) = ingest_resource(
+                conn,
+                session,
+                config.ckan_sql_endpoint,
+                resource,
+                config.target_year,
+                config.batch_size,
+                config.max_records,
+                source_rows_examined,
+                successful_rows,
+                successful_batches,
+                failed_batches,
+                batch_number,
+            )
 
     return RunSummary(
         source_rows_examined=source_rows_examined,
