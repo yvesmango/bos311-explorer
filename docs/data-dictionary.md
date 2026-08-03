@@ -27,4 +27,5 @@
 - `department_id`, `category_id`: normalized joins
 - `geo_point`: PostGIS point for map rendering and spatial analysis
 - `open_dt`, `closed_dt`, `sla_target_dt`, `due_date`: timeline fields
+- `description`: ticket narrative useful for map popups and issue context
 - `on_time`: SLA compliance flag

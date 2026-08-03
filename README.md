@@ -26,3 +26,25 @@ Supabase Session Pooler connection format, and the five starter questions in the
 
 The warehouse remains the source of truth; Metabase is the read-only analysis
 surface for maps, charts, tables, and future embeds.
+
+## Ingestion
+
+Run a full historical ingestion with:
+
+```bash
+uv run scripts/ingest_311.py
+```
+
+For a smaller test run, cap the source rows traversed:
+
+```bash
+INGESTION_MAX_RECORDS=1000 uv run scripts/ingest_311.py
+```
+
+The default batch size is `10000` rows. A full historical load is expected to
+take roughly 30 minutes for a dataset in the ~500,000 row range, depending on
+network and Supabase performance.
+
+If an ingestion run is interrupted, simply rerun the script. The current design
+is idempotent thanks to `ON CONFLICT` upserts. A persisted resume marker is a
+future enhancement, not a requirement for correctness today.

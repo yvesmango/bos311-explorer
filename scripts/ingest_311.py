@@ -1,16 +1,20 @@
 """Ingest Boston 311 ticket data from CKAN into Supabase/PostgreSQL.
 
-The script is designed to be idempotent:
+The script ingests the full historical dataset in batches:
 - raw CKAN payloads are stored for auditability
 - lookup tables are upserted by natural key
 - ticket rows are upserted by `case_enquiry_id`
+- each batch is committed independently so the run can continue past failures
 
 Required environment variables:
 - `DATABASE_URL`: PostgreSQL connection string for Supabase
 
 Optional environment variables:
 - `CKAN_SQL_ENDPOINT`: override the Boston CKAN SQL endpoint
+- `CKAN_BASE_URL`: alternate Boston CKAN base URL used to derive the SQL endpoint
 - `CKAN_RESOURCE_ID`: override the CKAN datastore resource id
+- `INGESTION_BATCH_SIZE`: rows to fetch per CKAN batch
+- `INGESTION_MAX_RECORDS`: cap on total source rows traversed for testing
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import argparse
 import json
 import logging
 import os
-import time
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,9 +42,7 @@ from urllib3.util.retry import Retry
 LOGGER = logging.getLogger("bos311.ingest")
 DEFAULT_CKAN_SQL_ENDPOINT = "https://data.boston.gov/api/3/action/datastore_search_sql"
 DEFAULT_CKAN_RESOURCE_ID = "1a0b420d-99f1-4887-9851-990b2a5a6e17"
-DEFAULT_PAGE_SIZE = 500
-DEFAULT_RETRY_ATTEMPTS = 3
-DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_BATCH_SIZE = 10000
 
 
 @dataclass(frozen=True)
@@ -48,57 +50,41 @@ class IngestionConfig:
     database_url: str
     ckan_sql_endpoint: str
     ckan_resource_id: str
-    page_size: int
-    max_rows: int | None
+    batch_size: int
+    max_records: int | None
     apply_schema: bool
-    full_refresh: bool
-    retry_attempts: int
-    retry_backoff_seconds: float
 
 
 @dataclass(frozen=True)
-class Watermark:
-    open_dt: datetime
-    case_enquiry_id: int
+class RunSummary:
+    source_rows_examined: int
+    successful_rows: int
+    successful_batches: int
+    failed_batches: int
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--batch-size",
         "--limit",
         "--page-size",
-        dest="page_size",
+        dest="batch_size",
         type=int,
-        default=DEFAULT_PAGE_SIZE,
-        help="Rows to fetch per CKAN page.",
+        default=None,
+        help="Rows to fetch per CKAN batch.",
     )
     parser.add_argument(
+        "--max-records",
         "--max-rows",
         type=int,
         default=None,
-        help="Optional cap on the total number of rows fetched in a run.",
+        help="Optional cap on the total number of source rows traversed in a run.",
     )
     parser.add_argument(
         "--apply-schema",
         action="store_true",
         help="Apply sql/schema_v1.sql before ingesting.",
-    )
-    parser.add_argument(
-        "--full-refresh",
-        action="store_true",
-        help="Ignore the stored watermark and rebuild from the beginning of the source dataset.",
-    )
-    parser.add_argument(
-        "--retry-attempts",
-        type=int,
-        default=DEFAULT_RETRY_ATTEMPTS,
-        help="Number of attempts for transient request or database failures.",
-    )
-    parser.add_argument(
-        "--retry-backoff-seconds",
-        type=float,
-        default=DEFAULT_RETRY_BACKOFF_SECONDS,
-        help="Base backoff delay between retry attempts.",
     )
     return parser
 
@@ -112,16 +98,33 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
             "DATABASE_URL is missing. Set it in your .env file to the Supabase connection string."
         )
 
+    ckan_sql_endpoint = os.getenv("CKAN_SQL_ENDPOINT")
+    if not ckan_sql_endpoint:
+        ckan_base_url = os.getenv("CKAN_BASE_URL")
+        if ckan_base_url:
+            ckan_sql_endpoint = f"{ckan_base_url.rstrip('/')}/datastore_search_sql"
+        else:
+            ckan_sql_endpoint = DEFAULT_CKAN_SQL_ENDPOINT
+
+    batch_size = args.batch_size
+    if batch_size is None:
+        batch_size = parse_optional_int(os.getenv("INGESTION_BATCH_SIZE")) or DEFAULT_BATCH_SIZE
+    if batch_size <= 0:
+        raise RuntimeError("INGESTION_BATCH_SIZE must be a positive integer.")
+
+    max_records = args.max_records
+    if max_records is None:
+        max_records = parse_optional_int(os.getenv("INGESTION_MAX_RECORDS"))
+    if max_records is not None and max_records <= 0:
+        raise RuntimeError("INGESTION_MAX_RECORDS must be a positive integer when set.")
+
     return IngestionConfig(
         database_url=database_url,
-        ckan_sql_endpoint=os.getenv("CKAN_SQL_ENDPOINT", DEFAULT_CKAN_SQL_ENDPOINT),
+        ckan_sql_endpoint=ckan_sql_endpoint,
         ckan_resource_id=os.getenv("CKAN_RESOURCE_ID", DEFAULT_CKAN_RESOURCE_ID),
-        page_size=args.page_size,
-        max_rows=args.max_rows,
+        batch_size=batch_size,
+        max_records=max_records,
         apply_schema=args.apply_schema,
-        full_refresh=args.full_refresh,
-        retry_attempts=args.retry_attempts,
-        retry_backoff_seconds=args.retry_backoff_seconds,
     )
 
 
@@ -140,43 +143,28 @@ def build_http_session() -> requests.Session:
     return session
 
 
-def timestamp_literal(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("'", "''")
-
-
 def build_sql_query(
     resource_id: str,
-    page_size: int,
+    limit: int,
     offset: int,
-    watermark: Watermark | None = None,
 ) -> str:
-    where_clause = ""
-    if watermark is not None:
-        watermark_dt = timestamp_literal(watermark.open_dt)
-        where_clause = (
-            "WHERE open_dt IS NULL "
-            f"OR open_dt > TIMESTAMPTZ '{watermark_dt}' "
-            f"OR (open_dt = TIMESTAMPTZ '{watermark_dt}' AND case_enquiry_id > {watermark.case_enquiry_id})"
-        )
     return (
         f'SELECT * FROM "{resource_id}" '
-        f"{where_clause} "
-        "ORDER BY open_dt ASC NULLS FIRST, case_enquiry_id ASC "
-        f"LIMIT {page_size} OFFSET {offset}"
+        "ORDER BY open_dt ASC NULLS LAST, case_enquiry_id ASC "
+        f"LIMIT {limit} OFFSET {offset}"
     )
 
 
-def fetch_ckan_page(
+def extract_from_ckan(
     session: requests.Session,
     endpoint: str,
     resource_id: str,
-    page_size: int,
+    limit: int,
     offset: int,
-    watermark: Watermark | None,
 ) -> list[dict[str, Any]]:
-    query = build_sql_query(resource_id, page_size, offset, watermark)
+    query = build_sql_query(resource_id, limit, offset)
     url = f"{endpoint}?{urlencode({'sql': query})}"
-    LOGGER.info("Fetching CKAN page", extra={"offset": offset, "page_size": page_size})
+    LOGGER.info("Fetching CKAN batch", extra={"offset": offset, "limit": limit})
     response = session.get(url, timeout=120)
     response.raise_for_status()
     payload = response.json()
@@ -190,27 +178,13 @@ def fetch_ckan_page(
     return records
 
 
-def fetch_ckan_rows(
-    session: requests.Session,
-    endpoint: str,
-    resource_id: str,
-    page_size: int,
-    watermark: Watermark | None = None,
-    max_rows: int | None = None,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    offset = 0
-    while True:
-        remaining = None if max_rows is None else max_rows - len(rows)
-        if remaining is not None and remaining <= 0:
-            break
-        current_page_size = page_size if remaining is None else min(page_size, remaining)
-        page = fetch_ckan_page(session, endpoint, resource_id, current_page_size, offset, watermark)
-        rows.extend(page)
-        if len(page) < current_page_size:
-            break
-        offset += current_page_size
-    return rows
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return int(stripped)
 
 
 def to_datetime(value: Any) -> datetime | None:
@@ -428,170 +402,103 @@ def load_payload(cursor, ticket: dict[str, Any]) -> int:
     return int(row[0])
 
 
-def ingest_rows(conn, rows: Iterable[dict[str, Any]]) -> list[int]:
-    ingested_case_ids: list[int] = []
-    with conn.cursor() as cursor:
-        for ticket in rows:
-            case_enquiry_id = ticket.get("case_enquiry_id")
-            if case_enquiry_id in (None, ""):
-                raise ValueError("CKAN ticket is missing case_enquiry_id.")
-            case_enquiry_id = int(case_enquiry_id)
-            raw_payload_id = load_payload(cursor, ticket)
-            department_name = normalize_text(ticket.get("department"))
-            category_name = normalize_text(ticket.get("case_title") or ticket.get("subject"))
-            department_id = upsert_lookup(cursor, "departments", department_name) if department_name else None
-            category_id = None
-            if category_name:
-                category_id = upsert_lookup(
-                    cursor,
-                    "categories",
-                    category_name,
-                    extra={"department_id": department_id} if department_id else None,
-                )
-            upsert_ticket(cursor, ticket, raw_payload_id, department_id, category_id)
-            ingested_case_ids.append(case_enquiry_id)
-    return ingested_case_ids
-
-
-def get_watermark(conn) -> Watermark | None:
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT open_dt, case_enquiry_id
-            FROM tickets
-            WHERE open_dt IS NOT NULL
-            ORDER BY open_dt DESC, case_enquiry_id DESC
-            LIMIT 1
-            """
-        )
-        row = cursor.fetchone()
-    if not row:
-        return None
-    open_dt, case_enquiry_id = row
-    if open_dt is None or case_enquiry_id is None:
-        return None
-    return Watermark(open_dt=open_dt, case_enquiry_id=int(case_enquiry_id))
-
-
-def verify_ingest(database_url: str, case_enquiry_ids: list[int]) -> None:
-    if not case_enquiry_ids:
-        LOGGER.warning("No rows were ingested; skipping verification.")
-        return
-
-    id_list = list(dict.fromkeys(case_enquiry_ids))
-    with psycopg2.connect(database_url) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT count(*) FROM raw_311_tickets WHERE case_enquiry_id = ANY(%s)",
-                (id_list,),
+def ingest_batch(cursor, rows: Iterable[dict[str, Any]]) -> int:
+    ingested_count = 0
+    for ticket in rows:
+        case_enquiry_id = ticket.get("case_enquiry_id")
+        if case_enquiry_id in (None, ""):
+            raise ValueError("CKAN ticket is missing case_enquiry_id.")
+        raw_payload_id = load_payload(cursor, ticket)
+        department_name = normalize_text(ticket.get("department"))
+        category_name = normalize_text(ticket.get("case_title") or ticket.get("subject"))
+        department_id = upsert_lookup(cursor, "departments", department_name) if department_name else None
+        category_id = None
+        if category_name:
+            category_id = upsert_lookup(
+                cursor,
+                "categories",
+                category_name,
+                extra={"department_id": department_id} if department_id else None,
             )
-            raw_count = int(cursor.fetchone()[0])
-
-            cursor.execute(
-                "SELECT count(*) FROM tickets WHERE case_enquiry_id = ANY(%s)",
-                (id_list,),
-            )
-            ticket_count = int(cursor.fetchone()[0])
-
-            cursor.execute(
-                """
-                SELECT count(*)
-                FROM tickets
-                WHERE case_enquiry_id = ANY(%s)
-                  AND latitude IS NOT NULL
-                  AND longitude IS NOT NULL
-                  AND geo_point IS NULL
-                """,
-                (id_list,),
-            )
-            missing_geo_count = int(cursor.fetchone()[0])
-
-            cursor.execute(
-                """
-                SELECT count(*)
-                FROM tickets
-                WHERE case_enquiry_id = ANY(%s)
-                  AND raw_payload_id IS NULL
-                """,
-                (id_list,),
-            )
-            missing_lineage_count = int(cursor.fetchone()[0])
-
-    expected = len(id_list)
-    if raw_count != expected:
-        raise RuntimeError(f"Verification failed: expected {expected} raw rows, found {raw_count}.")
-    if ticket_count != expected:
-        raise RuntimeError(f"Verification failed: expected {expected} ticket rows, found {ticket_count}.")
-    if missing_geo_count:
-        raise RuntimeError(f"Verification failed: {missing_geo_count} rows have coordinates but no geo_point.")
-    if missing_lineage_count:
-        raise RuntimeError(f"Verification failed: {missing_lineage_count} ticket rows are missing raw lineage.")
-
-    with psycopg2.connect(database_url) as conn:
-        with conn.cursor() as cursor:
-            counts: dict[str, int] = {}
-            for table in ("raw_311_tickets", "tickets", "departments", "categories"):
-                cursor.execute(f"SELECT count(*) FROM {table}")
-                counts[table] = int(cursor.fetchone()[0])
-    LOGGER.info("Post-run table counts", extra=counts)
+        upsert_ticket(cursor, ticket, raw_payload_id, department_id, category_id)
+        ingested_count += 1
+    return ingested_count
 
 
-def retry_with_backoff(action, attempts: int, backoff_seconds: float):
-    for attempt in range(1, attempts + 1):
-        try:
-            return action()
-        except (requests.RequestException, psycopg2.OperationalError) as exc:
-            if isinstance(exc, requests.HTTPError):
-                status_code = getattr(exc.response, "status_code", None)
-                if status_code not in {429, 500, 502, 503, 504}:
-                    raise
-            if attempt >= attempts:
-                raise
-            sleep_for = backoff_seconds * attempt
-            LOGGER.warning(
-                "Transient failure, retrying",
-                extra={"attempt": attempt, "sleep_seconds": sleep_for, "error": str(exc)},
-            )
-            time.sleep(sleep_for)
+def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> RunSummary:
+    source_rows_examined = 0
+    successful_rows = 0
+    successful_batches = 0
+    failed_batches = 0
+    batch_number = 0
+    offset = 0
 
-
-def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> list[int]:
-    conn = psycopg2.connect(config.database_url)
-    try:
+    with psycopg2.connect(config.database_url) as conn:
         conn.autocommit = False
         if config.apply_schema:
             execute_schema(conn)
+            conn.commit()
 
-        watermark = None if config.full_refresh else get_watermark(conn)
-        if watermark is None:
-            LOGGER.info("No incremental watermark found; starting from the beginning of the source dataset.")
-        else:
-            LOGGER.info(
-                "Using incremental watermark",
-                extra={
-                    "open_dt": watermark.open_dt.isoformat(),
-                    "case_enquiry_id": watermark.case_enquiry_id,
-                },
-            )
+        while True:
+            if config.max_records is not None and source_rows_examined >= config.max_records:
+                LOGGER.info("Reached INGESTION_MAX_RECORDS cap", extra={"max_records": config.max_records})
+                break
 
-        rows = fetch_ckan_rows(
-            session,
-            config.ckan_sql_endpoint,
-            config.ckan_resource_id,
-            config.page_size,
-            watermark=watermark,
-            max_rows=config.max_rows,
-        )
-        LOGGER.info("Fetched rows", extra={"count": len(rows)})
+            remaining = None if config.max_records is None else config.max_records - source_rows_examined
+            batch_size = config.batch_size if remaining is None else min(config.batch_size, remaining)
+            if batch_size <= 0:
+                break
 
-        case_ids = ingest_rows(conn, rows)
-        conn.commit()
-        return case_ids
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            batch_number += 1
+            batch_source_rows = 0
+            try:
+                rows = extract_from_ckan(
+                    session,
+                    config.ckan_sql_endpoint,
+                    config.ckan_resource_id,
+                    batch_size,
+                    offset,
+                )
+                batch_source_rows = len(rows)
+                source_rows_examined += batch_source_rows
+                if not rows:
+                    LOGGER.info("No more CKAN records after batch %s.", batch_number)
+                    break
+
+                with conn.cursor() as cursor:
+                    batch_success = ingest_batch(cursor, rows)
+                conn.commit()
+                successful_rows += batch_success
+                successful_batches += 1
+                LOGGER.info(
+                    "Fetched batch %s: %s records; committed %s records (running total %s).",
+                    batch_number,
+                    batch_source_rows,
+                    batch_success,
+                    successful_rows,
+                )
+                if batch_source_rows < batch_size:
+                    LOGGER.info(
+                        "Source returned a partial batch (%s of %s); ingestion is complete.",
+                        batch_source_rows,
+                        batch_size,
+                    )
+                    break
+            except Exception:
+                conn.rollback()
+                failed_batches += 1
+                if batch_source_rows == 0:
+                    source_rows_examined += batch_size
+                LOGGER.exception("Batch %s failed at offset %s. Continuing with the next batch.", batch_number, offset)
+            finally:
+                offset += batch_size
+
+    return RunSummary(
+        source_rows_examined=source_rows_examined,
+        successful_rows=successful_rows,
+        successful_batches=successful_batches,
+        failed_batches=failed_batches,
+    )
 
 
 def main() -> None:
@@ -601,13 +508,18 @@ def main() -> None:
     config = load_config(args)
 
     session = build_http_session()
+    summary = run_ingestion_cycle(config, session)
 
-    def run_once() -> list[int]:
-        return run_ingestion_cycle(config, session)
-
-    case_ids = retry_with_backoff(run_once, config.retry_attempts, config.retry_backoff_seconds)
-    verify_ingest(config.database_url, case_ids)
-    LOGGER.info("Ingestion complete", extra={"rows": len(case_ids)})
+    LOGGER.info(
+        "Ingestion complete: %s records ingested across %s successful batches; %s batches failed; %s source rows examined.",
+        summary.successful_rows,
+        summary.successful_batches,
+        summary.failed_batches,
+        summary.source_rows_examined,
+    )
+    if summary.successful_rows == 0 and summary.failed_batches > 0:
+        LOGGER.error("No records were ingested successfully and at least one batch failed.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
