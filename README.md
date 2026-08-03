@@ -69,6 +69,15 @@ this project on 2026 until that slice is proven stable.
 The default batch size is `10000` rows. For larger future backfills, runtime
 will depend on network and Supabase performance.
 
+The ingestion script reads from two Boston CKAN resource IDs during the
+transition:
+
+- Legacy resource: `1a0b420d-99f1-4887-9851-990b2a5a6e17`
+- New-system resource: `254adca6-64ab-4c5c-9fc0-a6da622be185`
+
+Each resource is tagged with a fixed `source_system` value during ingest, so
+the translator does not need to guess which vendor produced a row.
+
 The fetcher uses keyset pagination plus retry/backoff so it is gentler on the
 CKAN source than deep `OFFSET` paging. If the source pushes back, the script
 will automatically shrink the batch size and keep moving forward.

@@ -12,7 +12,9 @@ Required environment variables:
 Optional environment variables:
 - `CKAN_SQL_ENDPOINT`: override the Boston CKAN SQL endpoint
 - `CKAN_BASE_URL`: alternate Boston CKAN base URL used to derive the SQL endpoint
-- `CKAN_RESOURCE_ID`: override the CKAN datastore resource id
+- `CKAN_LEGACY_RESOURCE_ID`: override the legacy CKAN datastore resource id
+- `CKAN_NEW_RESOURCE_ID`: override the new-system CKAN datastore resource id
+- `CKAN_RESOURCE_ID`: legacy alias for `CKAN_LEGACY_RESOURCE_ID`
 - `INGESTION_TARGET_YEAR`: source year to ingest for the pilot (default: `2026`)
 - `INGESTION_BATCH_SIZE`: rows to fetch per CKAN batch
 - `INGESTION_MAX_RECORDS`: cap on total source rows traversed for testing
@@ -44,28 +46,19 @@ from urllib3.util.retry import Retry
 
 LOGGER = logging.getLogger("bos311.ingest")
 DEFAULT_CKAN_SQL_ENDPOINT = "https://data.boston.gov/api/3/action/datastore_search_sql"
-DEFAULT_CKAN_RESOURCE_ID = "1a0b420d-99f1-4887-9851-990b2a5a6e17"
+DEFAULT_LEGACY_CKAN_RESOURCE_ID = "1a0b420d-99f1-4887-9851-990b2a5a6e17"
+DEFAULT_NEW_CKAN_RESOURCE_ID = "254adca6-64ab-4c5c-9fc0-a6da622be185"
 DEFAULT_TARGET_YEAR = 2026
 DEFAULT_BATCH_SIZE = 10000
-NEW_SYSTEM_HINTS = {
-    "case id",
-    "open date",
-    "close date",
-    "target close date",
-    "case topic",
-    "service name",
-    "assigned team",
-    "closure comments",
-    "full street address",
-    "street number",
-}
+LEGACY_SOURCE_SYSTEM = "legacy_boston_311"
+NEW_SOURCE_SYSTEM = "new_boston_311"
 
 
 @dataclass(frozen=True)
 class IngestionConfig:
     database_url: str
     ckan_sql_endpoint: str
-    ckan_resource_id: str
+    source_resources: tuple["SourceResource", ...]
     target_year: int
     batch_size: int
     max_records: int | None
@@ -78,6 +71,12 @@ class RunSummary:
     successful_rows: int
     successful_batches: int
     failed_batches: int
+
+
+@dataclass(frozen=True)
+class SourceResource:
+    resource_id: str
+    source_system: str
 
 
 @dataclass(frozen=True)
@@ -160,6 +159,17 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
         else:
             ckan_sql_endpoint = DEFAULT_CKAN_SQL_ENDPOINT
 
+    legacy_resource_id = (
+        os.getenv("CKAN_LEGACY_RESOURCE_ID")
+        or os.getenv("CKAN_RESOURCE_ID")
+        or DEFAULT_LEGACY_CKAN_RESOURCE_ID
+    )
+    new_resource_id = os.getenv("CKAN_NEW_RESOURCE_ID") or DEFAULT_NEW_CKAN_RESOURCE_ID
+    source_resources = (
+        SourceResource(resource_id=legacy_resource_id, source_system=LEGACY_SOURCE_SYSTEM),
+        SourceResource(resource_id=new_resource_id, source_system=NEW_SOURCE_SYSTEM),
+    )
+
     target_year = args.target_year
     if target_year is None:
         target_year = parse_optional_int(os.getenv("INGESTION_TARGET_YEAR")) or DEFAULT_TARGET_YEAR
@@ -181,7 +191,7 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
     return IngestionConfig(
         database_url=database_url,
         ckan_sql_endpoint=ckan_sql_endpoint,
-        ckan_resource_id=os.getenv("CKAN_RESOURCE_ID", DEFAULT_CKAN_RESOURCE_ID),
+        source_resources=source_resources,
         target_year=target_year,
         batch_size=batch_size,
         max_records=max_records,
@@ -219,10 +229,6 @@ def payload_value(index: dict[str, Any], *names: str) -> Any:
         if value not in (None, ""):
             return value
     return None
-
-
-def is_new_system_ticket(index: dict[str, Any]) -> bool:
-    return any(normalize_key(hint) in index for hint in NEW_SYSTEM_HINTS)
 
 
 def parse_case_enquiry_id(value: Any) -> int:
@@ -335,52 +341,63 @@ def normalize_report_source(value: Any) -> str | None:
     return lowered
 
 
-def translate_ticket(ticket: dict[str, Any]) -> NormalizedTicket:
+def translate_ticket(ticket: dict[str, Any], source_system: str) -> NormalizedTicket:
     index = build_payload_index(ticket)
-    source_system = "new_boston_311" if is_new_system_ticket(index) else "legacy_boston_311"
 
     case_enquiry_id = parse_case_enquiry_id(
         payload_value(index, "case_enquiry_id", "case id")
     )
 
-    subject = normalize_text(
-        payload_value(
-            index,
-            "subject",
-            "assigned department",
-            "department",
-        )
-    )
-    description = normalize_text(
-        payload_value(
-            index,
-            "reason",
-            "description",
-        )
-    )
-    case_topic = normalize_text(
-        payload_value(
-            index,
-            "case_topic",
-            "case topic",
-            "case_title",
-            "type",
-        )
-    ) or description
-
-    if subject is None:
-        subject = normalize_text(
-            payload_value(
-                index,
-                "assigned department",
-                "subject",
-                "department",
-                "service name",
-            )
-        )
-
-    department_name = subject
-    category_name = case_topic
+    if source_system == LEGACY_SOURCE_SYSTEM:
+        subject = normalize_text(payload_value(index, "subject"))
+        description = normalize_text(payload_value(index, "reason"))
+        case_topic = normalize_text(payload_value(index, "case_title")) or description
+        department_name = normalize_text(payload_value(index, "department")) or subject
+        category_name = case_topic
+        street_name = normalize_text(payload_value(index, "location_street_name"))
+        neighborhood = normalize_text(payload_value(index, "neighborhood"))
+        ward = normalize_text(payload_value(index, "ward"))
+        precinct = normalize_text(payload_value(index, "precinct"))
+        city_council_district = normalize_text(payload_value(index, "city_council_district"))
+        source = normalize_report_source(payload_value(index, "source"))
+        request_type = normalize_text(payload_value(index, "type"))
+        service_name = None
+        assigned_team = None
+        closure_comments = None
+        street_number = None
+        full_street_address = None
+        open_dt = to_datetime(payload_value(index, "open_dt"))
+        closed_dt = to_datetime(payload_value(index, "closed_dt"))
+        sla_target_dt = to_datetime(payload_value(index, "sla_target_dt"))
+        due_date = to_datetime(payload_value(index, "due_date"))
+        on_time = normalize_on_time(payload_value(index, "on_time"))
+        latitude = to_float(payload_value(index, "latitude"))
+        longitude = to_float(payload_value(index, "longitude"))
+    else:
+        subject = normalize_text(payload_value(index, "subject", "assigned department"))
+        description = normalize_text(payload_value(index, "description"))
+        case_topic = normalize_text(payload_value(index, "case_topic", "case topic", "type")) or description
+        department_name = normalize_text(payload_value(index, "assigned department")) or subject
+        category_name = case_topic
+        street_name = normalize_text(payload_value(index, "street name", "location"))
+        neighborhood = normalize_text(payload_value(index, "neighborhood"))
+        ward = normalize_text(payload_value(index, "ward"))
+        precinct = normalize_text(payload_value(index, "precinct"))
+        city_council_district = normalize_text(payload_value(index, "city council district"))
+        source = normalize_report_source(payload_value(index, "report source", "source"))
+        service_name = normalize_text(payload_value(index, "service name"))
+        request_type = normalize_text(payload_value(index, "type")) or service_name
+        assigned_team = normalize_text(payload_value(index, "assigned team"))
+        closure_comments = normalize_text(payload_value(index, "closure comments"))
+        street_number = normalize_text(payload_value(index, "street number"))
+        full_street_address = normalize_text(payload_value(index, "full street address", "location"))
+        open_dt = to_datetime(payload_value(index, "open date"))
+        closed_dt = to_datetime(payload_value(index, "close date"))
+        sla_target_dt = to_datetime(payload_value(index, "target close date"))
+        due_date = to_datetime(payload_value(index, "due date"))
+        on_time = normalize_on_time(payload_value(index, "on time?"))
+        latitude = to_float(payload_value(index, "latitude y", "latitude"))
+        longitude = to_float(payload_value(index, "longitude x", "longitude"))
 
     return NormalizedTicket(
         case_enquiry_id=case_enquiry_id,
@@ -391,29 +408,25 @@ def translate_ticket(ticket: dict[str, Any]) -> NormalizedTicket:
         department_name=department_name,
         category_name=category_name,
         case_status=normalize_case_status(payload_value(index, "case_status", "case status")),
-        street_name=normalize_text(
-            payload_value(index, "street_name", "location_street_name", "street name")
-        ),
-        neighborhood=normalize_text(payload_value(index, "neighborhood")),
-        ward=normalize_text(payload_value(index, "ward")),
-        precinct=normalize_text(payload_value(index, "precinct")),
-        city_council_district=normalize_text(payload_value(index, "city_council_district", "city council district")),
-        source=normalize_report_source(payload_value(index, "source", "report source")),
-        request_type=normalize_text(payload_value(index, "type", "service name")),
-        service_name=normalize_text(payload_value(index, "service name")) if source_system == "new_boston_311" else None,
-        assigned_team=normalize_text(payload_value(index, "assigned team")) if source_system == "new_boston_311" else None,
-        closure_comments=normalize_text(payload_value(index, "closure comments")) if source_system == "new_boston_311" else None,
-        street_number=normalize_text(payload_value(index, "street number")) if source_system == "new_boston_311" else None,
-        full_street_address=normalize_text(
-            payload_value(index, "full street address", "location")
-        ) if source_system == "new_boston_311" else None,
-        open_dt=to_datetime(payload_value(index, "open_dt", "open date")),
-        closed_dt=to_datetime(payload_value(index, "closed_dt", "close date")),
-        sla_target_dt=to_datetime(payload_value(index, "sla_target_dt", "target close date")),
-        due_date=to_datetime(payload_value(index, "due_date", "due date")),
-        on_time=normalize_on_time(payload_value(index, "on_time", "on time?")),
-        latitude=to_float(payload_value(index, "latitude", "latitude(y)", "latitude y")),
-        longitude=to_float(payload_value(index, "longitude", "longitude(x)", "longitude x")),
+        street_name=street_name,
+        neighborhood=neighborhood,
+        ward=ward,
+        precinct=precinct,
+        city_council_district=city_council_district,
+        source=source,
+        request_type=request_type,
+        service_name=service_name,
+        assigned_team=assigned_team,
+        closure_comments=closure_comments,
+        street_number=street_number,
+        full_street_address=full_street_address,
+        open_dt=open_dt,
+        closed_dt=closed_dt,
+        sla_target_dt=sla_target_dt,
+        due_date=due_date,
+        on_time=on_time,
+        latitude=latitude,
+        longitude=longitude,
     )
 
 
