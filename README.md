@@ -12,6 +12,26 @@ This project turns Boston 311 service request data into a clean, queryable wareh
 - Local secrets kept in `.env`
 - Git repository initialized locally on `main`
 
+## Schema migrations
+
+The repository keeps the database structure in two layers:
+
+1. [`sql/schema_v1.sql`](sql/schema_v1.sql) for the base warehouse schema
+2. [`sql/migrations/002_add_transition_columns.sql`](sql/migrations/002_add_transition_columns.sql) for the transition-era columns already applied in Supabase
+
+Apply the base schema first, then the migration, so the repo and the live
+database stay aligned:
+
+```bash
+psql "$DATABASE_URL" -f sql/schema_v1.sql
+psql "$DATABASE_URL" -f sql/migrations/002_add_transition_columns.sql
+```
+
+If you are working against the existing hosted Supabase project, those
+transition columns are already present in the live database. The migration file
+exists to make that state reproducible from source control and to keep future
+environments in sync.
+
 ## Next milestones
 
 1. Build the ingestion pipeline from the Boston CKAN API.
