@@ -14,3 +14,6 @@ uv.lock
 # Local data and runtime state
 data/
 .state/
+
+# Public repo uses the Markdown render instead of the raw ingest script
+pipeline/ingest_311.py

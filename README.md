@@ -2,7 +2,6 @@
 
 BOS311 Explorer is a compact Boston 311 civic data project that turns public service-request data into a clean, queryable warehouse and a Metabase-ready analytics layer.
 
-It is designed to be easy to read, easy to rebuild, and easy to explain to hiring managers in journalism and civic tech.
 
 ## What it does
 
@@ -11,75 +10,73 @@ It is designed to be easy to read, easy to rebuild, and easy to explain to hirin
 - Keeps raw payloads for auditability and replay
 - Loads a clean warehouse schema for analytics and dashboarding
 - Supports a public-facing Metabase exploration workflow
+- Publishes the ingest pipeline as a Markdown walkthrough in `pipeline/ingest_311.md`
 
-## Repository layout
 
-```text
-bos311-explorer/
-├── README.md
-├── executive-summary.md
-├── .gitignore
-├── pipeline/
-│   ├── ingest_311.py
-│   └── pyproject.toml
-├── sql/
-│   └── schema.sql
-└── docs/
-    └── data_dictionary.md
-```
+# BOS311 Civic Data Explorer
 
-## Data model
+This project turns Boston 311 service request data into a clean, queryable warehouse that can support both public-facing maps and analytics-ready datasets. It ingests live and historical service requests from the City of Boston's open data portal, normalizes them across a legacy-to-new system transition, and powers an interactive Metabase dashboard designed for editors, reporters, and civic readers.
 
-The warehouse uses a small, readable set of tables:
 
-- `raw_311_tickets` for exact payload retention
-- `departments` and `categories` for lookup-based normalization
-- `tickets` for the clean source of truth
-- `ticket_status_history` for status-change auditing
+---
 
-The schema keeps the important civic fields in one place:
+## Data Sources
 
-- `open_dt`, `closed_dt`, and `sla_target_dt` for timelines
-- `case_status` and `on_time` for service performance
-- `latitude`, `longitude`, and `geo_point` for maps
-- `subject`, `description`, and `case_topic` for the human-readable story of each ticket
-- `source_system` for lineage across the vendor transition
+This project relies on a single public dataset maintained by the City of Boston through the [Analyze Boston](https://data.boston.gov/) open data portal, powered by CKAN:
 
-## Pipeline
+- **311 Service Requests** — every service request submitted by Boston residents, including issue type, location, timestamps, SLA targets, and closure details.
 
-The Python pipeline lives in `pipeline/ingest_311.py` and is managed with `uv`.
+During the current vendor transition, the city maintains **two distinct resource endpoints** under the same dataset umbrella:
 
-From the repository root:
+| Resource | Status |
+|---|---|
+| Legacy 311 system (`1a0b420d-...`) | Historical data through mid-2026 |
+| New 311 system (`254adca6-...`) | Live data as services migrate |
 
-```bash
-cd pipeline
-uv run ingest_311.py
-```
+The pipeline ingests from both endpoints and merges them into a single, unified warehouse so that users see a seamless historical view regardless of which vendor generated each ticket.
 
-Helpful environment variables:
+---
 
-- `DATABASE_URL` for the Supabase/PostgreSQL connection string
-- `CKAN_SQL_ENDPOINT` if the Boston open data endpoint changes
-- `INGESTION_TARGET_YEAR` to switch the load year
-- `INGESTION_BATCH_SIZE` to tune batch size
-- `INGESTION_MAX_RECORDS` for capped smoke tests
-- `INGESTION_MODE` for `incremental` or `backfill`
-- `INGESTION_CHECKPOINT_PATH` to move the local resume file
+## Methodology
 
-The pipeline is idempotent and checkpoint-aware, so reruns resume from the last committed batch instead of replaying the entire source every time.
+### The Unified Civic Archive
 
-## Dashboard workflow
+Rather than building separate pipelines for the legacy and new systems, this project treats them as two dialects of the same language. A Python-based ETL pipeline pulls from both CKAN resource IDs, applies a normalization layer, and loads the results into a single Supabase data warehouse.
 
-Metabase is the intended analysis layer for the repo.
+The warehouse is built around three core principles:
 
-The warehouse is the source of truth; Metabase is the read-only surface for maps, charts, tables, and future sharing.
+1. **Abstraction over duplication.** Columns like `case_topic` and `case_status` are normalized so that a journalist querying the warehouse never needs to know which system generated a record.
+2. **Hierarchy preservation.** The legacy data's 4-level taxonomy (`subject` → `reason` → `case_title` → `queue`) is preserved through hierarchical category mapping, allowing users to query at whatever level of granularity they need.
+3. **Auditability.** Every record is tagged with a `source_system` field, and raw payloads are retained in a JSONB staging table so any transformation decision can be traced back to the original data.
 
-## Scope
+### The Dashboard
 
-This repo is intentionally small:
+The Metabase dashboard is split into two tabs:
 
-- no dashboard app source
-- no API layer
-- no extra infrastructure
+- **Volume Tracker** — topline KPIs, trend comparisons, and geographic heatmaps for the big picture.
+- **Ticket Explorer** — deep-dive charts into departments, case topics, neighborhoods, and SLA compliance.
 
-The point is to show a clean civic data engineering workflow, not a sprawling internal toolchain.
+Every visualization is interactive and filterable by date range, status, and neighborhood.
+
+---
+
+## Key Challenges
+
+### 1. A Hybrid, Transitional Data Source
+
+Boston's 311 system is migrating from a legacy vendor to a new one on a staggered schedule through late 2026. Different services transitioned on different dates, meaning the live CKAN API returns a fragmented mix of two taxonomies.
+
+**How we overcame it:** Instead of building fragile row-by-row detection logic, the pipeline iterates over two distinct resource IDs and tags every record with its source system. This turns a messy data problem into a clean, endpoint-driven ETL architecture that scales as more services migrate.
+
+### 2. A Hidden Data Hierarchy
+
+Initial assumptions about the legacy schema were wrong. Data profiling revealed a 4-level hierarchy (`subject` → `reason` → `case_title` → `queue`) that wasn't obvious from column names alone. `case_title` and `type` turned out to be duplicates; `subject` was the broad department, not a description; `reason` was the sub-department context.
+
+**How we overcame it:** We redesigned the `categories` lookup table to store hierarchical, concatenated categories (e.g., "Housing - Pest Infestation - Residential") so that journalists can query at any level of granularity. The map popup was redesigned to surface only the human-readable layers.
+
+
+### 3. Inconsistent Department Naming
+
+The legacy CKAN data stores the same departments under slightly different names (e.g., "Public Works Department" and "Public Works Department (PWD)"), fragmenting accountability metrics.
+
+**How we overcame it:** We documented the issue and designed a normalization layer in the ingestion script to consolidate known variants into canonical names. This fix is staged for the next pipeline run and will immediately clean up the dashboard's department-level metrics.
