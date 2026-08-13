@@ -10,7 +10,7 @@ BOS311 Explorer is a compact Boston 311 civic data project that turns public ser
 - Keeps raw payloads for auditability and replay
 - Loads a clean warehouse schema for analytics and dashboarding
 - Supports a public-facing Metabase exploration workflow
-- Keeps the runnable ingest script in `pipeline/ingest_311.py`
+- Keeps the runnable ingest script in your local workspace only
 - Publishes the ingest pipeline as a Markdown walkthrough in `pipeline/ingest_311.md`
 
 

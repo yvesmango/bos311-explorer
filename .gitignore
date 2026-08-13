@@ -14,3 +14,6 @@ uv.lock
 # Local data and runtime state
 data/
 .state/
+
+# Local-only runnable ingest script
+pipeline/ingest_311.py

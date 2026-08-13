@@ -1,7 +1,7 @@
 # BOS311 Ingest Pipeline
 
 
-This page is the public-facing render of the ingest pipeline. The runnable source remains in `pipeline/ingest_311.py`, and the code block below preserves the implementation in a readable, GitHub-friendly format.
+This page is the public-facing render of the ingest pipeline. The runnable source stays in your local workspace, and the code block below preserves the implementation in a readable, GitHub-friendly format.
 
 ```python
 """Ingest Boston 311 ticket data from CKAN into Supabase/PostgreSQL.
