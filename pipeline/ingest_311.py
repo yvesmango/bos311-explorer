@@ -18,6 +18,9 @@ Optional environment variables:
 - `INGESTION_TARGET_YEAR`: source year to ingest for the pilot (default: `2026`)
 - `INGESTION_BATCH_SIZE`: rows to fetch per CKAN batch
 - `INGESTION_MAX_RECORDS`: cap on total source rows traversed for testing
+- `INGESTION_CHECKPOINT_PATH`: local JSON file used to resume partial runs
+- `INGESTION_STATEMENT_TIMEOUT_MS`: Postgres statement timeout for ingest writes (default: `0`, disabled)
+- `INGESTION_MODE`: `incremental` (default) or `backfill`
 """
 
 from __future__ import annotations
@@ -52,6 +55,9 @@ DEFAULT_TARGET_YEAR = 2026
 DEFAULT_BATCH_SIZE = 10000
 LEGACY_SOURCE_SYSTEM = "legacy_boston_311"
 NEW_SOURCE_SYSTEM = "new_boston_311"
+DEFAULT_CHECKPOINT_PATH = Path(".state") / "ingest_311_checkpoint.json"
+INGESTION_MODE_INCREMENTAL = "incremental"
+INGESTION_MODE_BACKFILL = "backfill"
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,10 @@ class IngestionConfig:
     target_year: int
     batch_size: int
     max_records: int | None
+    checkpoint_path: Path
+    reset_checkpoint: bool
+    statement_timeout_ms: int
+    ingest_mode: str
     apply_schema: bool
 
 
@@ -77,6 +87,28 @@ class RunSummary:
 class SourceResource:
     resource_id: str
     source_system: str
+
+
+@dataclass(frozen=True)
+class CheckpointCursor:
+    open_dt: str
+    case_enquiry_id: int
+
+
+@dataclass(frozen=True)
+class ResourceCheckpoint:
+    source_system: str
+    completed: bool
+    cursor: CheckpointCursor | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class CheckpointState:
+    version: int
+    target_year: int
+    resources: dict[str, ResourceCheckpoint]
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -137,7 +169,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply-schema",
         action="store_true",
-        help="Apply sql/schema_v1.sql before ingesting.",
+        help="Apply sql/schema.sql before ingesting.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Local JSON file used to resume partial runs.",
+    )
+    parser.add_argument(
+        "--reset-checkpoint",
+        action="store_true",
+        help="Ignore and overwrite any existing checkpoint before ingesting.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=(INGESTION_MODE_INCREMENTAL, INGESTION_MODE_BACKFILL),
+        default=None,
+        help="Ingestion behavior. Incremental rechecks completed resources; backfill skips them.",
     )
     return parser
 
@@ -188,6 +237,23 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
     if max_records is not None and max_records <= 0:
         raise RuntimeError("INGESTION_MAX_RECORDS must be a positive integer when set.")
 
+    statement_timeout_ms = parse_optional_int(os.getenv("INGESTION_STATEMENT_TIMEOUT_MS"))
+    if statement_timeout_ms is None:
+        statement_timeout_ms = 0
+    if statement_timeout_ms < 0:
+        raise RuntimeError("INGESTION_STATEMENT_TIMEOUT_MS must be 0 or a positive integer.")
+
+    ingest_mode = args.mode or os.getenv("INGESTION_MODE") or INGESTION_MODE_INCREMENTAL
+    if ingest_mode not in {INGESTION_MODE_INCREMENTAL, INGESTION_MODE_BACKFILL}:
+        raise RuntimeError(
+            "INGESTION_MODE must be either 'incremental' or 'backfill'."
+        )
+
+    checkpoint_path = args.checkpoint_path
+    if checkpoint_path is None:
+        checkpoint_path_value = os.getenv("INGESTION_CHECKPOINT_PATH")
+        checkpoint_path = Path(checkpoint_path_value) if checkpoint_path_value else DEFAULT_CHECKPOINT_PATH
+
     return IngestionConfig(
         database_url=database_url,
         ckan_sql_endpoint=ckan_sql_endpoint,
@@ -195,6 +261,10 @@ def load_config(args: argparse.Namespace) -> IngestionConfig:
         target_year=target_year,
         batch_size=batch_size,
         max_records=max_records,
+        checkpoint_path=checkpoint_path,
+        reset_checkpoint=args.reset_checkpoint,
+        statement_timeout_ms=statement_timeout_ms,
+        ingest_mode=ingest_mode,
         apply_schema=args.apply_schema,
     )
 
@@ -237,6 +307,30 @@ def parse_case_enquiry_id(value: Any) -> int:
     return int(value)
 
 
+def source_case_enquiry_id_field(source_system: str) -> str:
+    if source_system == LEGACY_SOURCE_SYSTEM:
+        return "case_enquiry_id"
+    return "_id"
+
+
+def source_open_dt_field(source_system: str) -> str:
+    if source_system == LEGACY_SOURCE_SYSTEM:
+        return "open_dt"
+    return "open_date"
+
+
+def source_open_dt_sql_expression(source_system: str) -> str:
+    if source_system == LEGACY_SOURCE_SYSTEM:
+        return "open_dt"
+    return 'CASE WHEN "open_date" = \'\' THEN NULL ELSE "open_date"::timestamptz END'
+
+
+def source_pagination_id_field(source_system: str) -> str:
+    if source_system == LEGACY_SOURCE_SYSTEM:
+        return "case_enquiry_id"
+    return "_id"
+
+
 def timestamp_literal(value: datetime | None) -> str:
     if value is None:
         return "TIMESTAMPTZ 'infinity'"
@@ -252,22 +346,28 @@ def year_bounds(target_year: int) -> tuple[str, str]:
 
 def build_sql_query(
     resource_id: str,
+    open_dt_sql_expression: str,
+    pagination_id_field: str,
     limit: int,
     target_year: int,
     cursor: tuple[datetime, int] | None,
 ) -> str:
     start_literal, end_literal = year_bounds(target_year)
-    where_clause = f"WHERE open_dt >= TIMESTAMPTZ '{start_literal}' AND open_dt < TIMESTAMPTZ '{end_literal}' "
+    where_clause = (
+        f"WHERE {open_dt_sql_expression} >= TIMESTAMPTZ '{start_literal}' "
+        f"AND {open_dt_sql_expression} < TIMESTAMPTZ '{end_literal}' "
+    )
     if cursor is not None:
         cursor_open_dt, cursor_case_enquiry_id = cursor
         where_clause += (
             "AND "
-            f"(open_dt, case_enquiry_id) > ({timestamp_literal(cursor_open_dt)}, {cursor_case_enquiry_id}) "
+            f"({open_dt_sql_expression}, {pagination_id_field}) > "
+            f"({timestamp_literal(cursor_open_dt)}, {cursor_case_enquiry_id}) "
         )
     return (
         f'SELECT * FROM "{resource_id}" '
         f"{where_clause}"
-        "ORDER BY open_dt ASC, case_enquiry_id ASC "
+        f"ORDER BY {open_dt_sql_expression} ASC, {pagination_id_field} ASC "
         f"LIMIT {limit}"
     )
 
@@ -276,15 +376,32 @@ def extract_from_ckan(
     session: requests.Session,
     endpoint: str,
     resource_id: str,
+    open_dt_sql_expression: str,
+    pagination_id_field: str,
     target_year: int,
     limit: int,
     cursor: tuple[datetime, int] | None,
 ) -> list[dict[str, Any]]:
-    query = build_sql_query(resource_id, limit, target_year, cursor)
+    query = build_sql_query(
+        resource_id,
+        open_dt_sql_expression,
+        pagination_id_field,
+        limit,
+        target_year,
+        cursor,
+    )
     url = f"{endpoint}?{urlencode({'sql': query})}"
     LOGGER.info("Fetching CKAN batch", extra={"cursor": cursor, "limit": limit})
     response = session.get(url, timeout=120)
-    response.raise_for_status()
+
+    if response.status_code != 200:
+        body_preview = response.text.strip()
+        if len(body_preview) > 2000:
+            body_preview = f"{body_preview[:2000]}..."
+        raise RuntimeError(
+            f"CKAN HTTP {response.status_code} for resource {resource_id}: {body_preview}"
+        )
+
     payload = response.json()
 
     if not payload.get("success"):
@@ -303,6 +420,177 @@ def parse_optional_int(value: str | None) -> int | None:
     if not stripped:
         return None
     return int(stripped)
+
+
+def checkpoint_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def checkpoint_cursor_from_row(
+    row: dict[str, Any],
+    open_dt_field: str,
+    pagination_id_field: str,
+) -> CheckpointCursor | None:
+    open_dt = to_datetime(row.get(open_dt_field))
+    case_enquiry_id = row.get(pagination_id_field)
+    if open_dt is None or case_enquiry_id in (None, ""):
+        return None
+    return CheckpointCursor(
+        open_dt=open_dt.astimezone(timezone.utc).isoformat(),
+        case_enquiry_id=int(case_enquiry_id),
+    )
+
+
+def checkpoint_state_to_dict(state: CheckpointState) -> dict[str, Any]:
+    return {
+        "version": state.version,
+        "target_year": state.target_year,
+        "updated_at": state.updated_at,
+        "resources": {
+            resource_id: {
+                "source_system": checkpoint.source_system,
+                "completed": checkpoint.completed,
+                "cursor": None
+                if checkpoint.cursor is None
+                else {
+                    "open_dt": checkpoint.cursor.open_dt,
+                    "case_enquiry_id": checkpoint.cursor.case_enquiry_id,
+                },
+                "updated_at": checkpoint.updated_at,
+            }
+            for resource_id, checkpoint in state.resources.items()
+        },
+    }
+
+
+def checkpoint_state_from_dict(payload: dict[str, Any], target_year: int) -> CheckpointState | None:
+    if payload.get("version") != 1 or payload.get("target_year") != target_year:
+        return None
+    raw_resources = payload.get("resources")
+    if not isinstance(raw_resources, dict):
+        return None
+
+    resources: dict[str, ResourceCheckpoint] = {}
+    for resource_id, raw_resource in raw_resources.items():
+        if not isinstance(raw_resource, dict):
+            continue
+        source_system = raw_resource.get("source_system")
+        if not isinstance(source_system, str) or not source_system:
+            continue
+        raw_cursor = raw_resource.get("cursor")
+        cursor = None
+        if isinstance(raw_cursor, dict):
+            open_dt = normalize_text(raw_cursor.get("open_dt"))
+            case_enquiry_id = raw_cursor.get("case_enquiry_id")
+            if open_dt and case_enquiry_id not in (None, ""):
+                try:
+                    cursor = CheckpointCursor(open_dt=open_dt, case_enquiry_id=int(case_enquiry_id))
+                except (TypeError, ValueError):
+                    cursor = None
+        resources[str(resource_id)] = ResourceCheckpoint(
+            source_system=source_system,
+            completed=bool(raw_resource.get("completed")),
+            cursor=cursor,
+            updated_at=normalize_text(raw_resource.get("updated_at")) or checkpoint_timestamp(),
+        )
+
+    return CheckpointState(
+        version=1,
+        target_year=target_year,
+        resources=resources,
+        updated_at=normalize_text(payload.get("updated_at")) or checkpoint_timestamp(),
+    )
+
+
+def load_checkpoint_state(path: Path, target_year: int, reset_checkpoint: bool) -> CheckpointState:
+    if reset_checkpoint and path.exists():
+        path.unlink()
+    if not path.exists():
+        return CheckpointState(version=1, target_year=target_year, resources={}, updated_at=checkpoint_timestamp())
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        LOGGER.warning("Ignoring unreadable checkpoint file at %s.", path)
+        return CheckpointState(version=1, target_year=target_year, resources={}, updated_at=checkpoint_timestamp())
+
+    state = checkpoint_state_from_dict(payload, target_year)
+    if state is None:
+        LOGGER.warning("Ignoring incompatible checkpoint file at %s.", path)
+        return CheckpointState(version=1, target_year=target_year, resources={}, updated_at=checkpoint_timestamp())
+    return state
+
+
+def save_checkpoint_state(path: Path, state: CheckpointState) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(checkpoint_state_to_dict(state), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        tmp_path.replace(path)
+    except Exception:
+        LOGGER.warning("Unable to write checkpoint file at %s.", path)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def resource_is_completed(state: CheckpointState, resource: SourceResource) -> bool:
+    checkpoint = state.resources.get(resource.resource_id)
+    return bool(checkpoint and checkpoint.completed)
+
+
+def resource_resume_cursor(
+    state: CheckpointState,
+    resource: SourceResource,
+    ingest_mode: str,
+) -> tuple[datetime, int] | None:
+    checkpoint = state.resources.get(resource.resource_id)
+    if checkpoint is None or checkpoint.source_system != resource.source_system:
+        return None
+    if checkpoint.completed and ingest_mode == INGESTION_MODE_BACKFILL:
+        return None
+    if checkpoint.cursor is None:
+        return None
+    open_dt = to_datetime(checkpoint.cursor.open_dt)
+    if open_dt is None:
+        return None
+    return open_dt, checkpoint.cursor.case_enquiry_id
+
+
+def update_checkpoint_state(
+    state: CheckpointState,
+    path: Path,
+    resource: SourceResource,
+    cursor: tuple[datetime, int] | None,
+    completed: bool,
+) -> CheckpointState:
+    resources = dict(state.resources)
+    resources[resource.resource_id] = ResourceCheckpoint(
+        source_system=resource.source_system,
+        completed=completed,
+        cursor=(
+            CheckpointCursor(
+                open_dt=cursor[0].astimezone(timezone.utc).isoformat(),
+                case_enquiry_id=cursor[1],
+            )
+            if cursor is not None
+            else None
+        ),
+        updated_at=checkpoint_timestamp(),
+    )
+    new_state = CheckpointState(
+        version=state.version,
+        target_year=state.target_year,
+        resources=resources,
+        updated_at=checkpoint_timestamp(),
+    )
+    save_checkpoint_state(path, new_state)
+    return new_state
 
 
 def normalize_case_status(value: Any) -> str | None:
@@ -345,7 +633,7 @@ def translate_ticket(ticket: dict[str, Any], source_system: str) -> NormalizedTi
     index = build_payload_index(ticket)
 
     case_enquiry_id = parse_case_enquiry_id(
-        payload_value(index, "case_enquiry_id", "case id")
+        payload_value(index, source_case_enquiry_id_field(source_system), "case_enquiry_id", "case id")
     )
 
     if source_system == LEGACY_SOURCE_SYSTEM:
@@ -486,7 +774,7 @@ def make_geo_point_sql(latitude: Any, longitude: Any) -> tuple[float | None, flo
 
 
 def execute_schema(conn) -> None:
-    schema_path = Path(__file__).resolve().parents[1] / "sql" / "schema_v1.sql"
+    schema_path = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
     with schema_path.open("r", encoding="utf-8") as handle:
         schema_sql = handle.read()
     with conn.cursor() as cursor:
@@ -701,13 +989,15 @@ def ingest_resource(
     target_year: int,
     batch_size: int,
     max_records: int | None,
+    checkpoint_state: CheckpointState,
+    checkpoint_path: Path,
     source_rows_examined: int,
     successful_rows: int,
     successful_batches: int,
     failed_batches: int,
     starting_batch_number: int,
-) -> tuple[int, int, int, int, int]:
-    cursor: tuple[datetime, int] | None = None
+) -> tuple[CheckpointState, int, int, int, int, int]:
+    cursor = resource_resume_cursor(checkpoint_state, resource)
     current_batch_size = batch_size
     batch_number = starting_batch_number
 
@@ -728,6 +1018,8 @@ def ingest_resource(
                 session,
                 ckan_sql_endpoint,
                 resource.resource_id,
+                source_open_dt_sql_expression(resource.source_system),
+                source_pagination_id_field(resource.source_system),
                 target_year,
                 current_limit,
                 cursor,
@@ -735,6 +1027,13 @@ def ingest_resource(
             batch_source_rows = len(rows)
             source_rows_examined += batch_source_rows
             if not rows:
+                checkpoint_state = update_checkpoint_state(
+                    checkpoint_state,
+                    checkpoint_path,
+                    resource,
+                    cursor,
+                    completed=True,
+                )
                 LOGGER.info(
                     "No more CKAN records after batch %s for %s.",
                     batch_number,
@@ -749,13 +1048,22 @@ def ingest_resource(
             successful_batches += 1
             current_batch_size = batch_size
             last_ticket = rows[-1]
-            last_open_dt = to_datetime(last_ticket.get("open_dt"))
-            last_case_enquiry_id = last_ticket.get("case_enquiry_id")
+            last_open_dt = to_datetime(last_ticket.get(source_open_dt_field(resource.source_system)))
+            last_case_enquiry_id = last_ticket.get(source_pagination_id_field(resource.source_system))
             if last_open_dt is None:
-                raise ValueError("CKAN batch ended without an open_dt within the pilot year.")
+                raise ValueError(
+                    "CKAN batch ended without an open_dt/open_date within the pilot year."
+                )
             if last_case_enquiry_id in (None, ""):
                 raise ValueError("CKAN batch ended without a case_enquiry_id.")
             cursor = (last_open_dt, int(last_case_enquiry_id))
+            checkpoint_state = update_checkpoint_state(
+                checkpoint_state,
+                checkpoint_path,
+                resource,
+                cursor,
+                completed=batch_source_rows < current_limit,
+            )
             LOGGER.info(
                 "Fetched batch %s from %s: %s records; committed %s records (running total %s).",
                 batch_number,
@@ -794,7 +1102,7 @@ def ingest_resource(
                 current_batch_size = next_batch_size
             time.sleep(min(30, 2 ** min(failed_batches, 5)))
 
-    return source_rows_examined, successful_rows, successful_batches, failed_batches, batch_number
+    return checkpoint_state, source_rows_examined, successful_rows, successful_batches, failed_batches, batch_number
 
 
 def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> RunSummary:
@@ -802,21 +1110,36 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
     successful_rows = 0
     successful_batches = 0
     failed_batches = 0
+    checkpoint_state = load_checkpoint_state(config.checkpoint_path, config.target_year, config.reset_checkpoint)
 
     with psycopg2.connect(config.database_url) as conn:
         conn.autocommit = False
+        with conn.cursor() as cursor:
+            cursor.execute(f"SET statement_timeout = '{config.statement_timeout_ms}ms'")
         if config.apply_schema:
             execute_schema(conn)
             conn.commit()
 
         batch_number = 0
         for resource in config.source_resources:
+            if config.ingest_mode == INGESTION_MODE_BACKFILL and resource_is_completed(checkpoint_state, resource):
+                LOGGER.info(
+                    "Skipping completed resource %s for %s from checkpoint.",
+                    resource.resource_id,
+                    resource.source_system,
+                )
+                continue
+
+            resume_cursor = resource_resume_cursor(checkpoint_state, resource, config.ingest_mode)
             LOGGER.info(
-                "Starting CKAN resource %s for %s.",
+                "Starting CKAN resource %s for %s%s in %s mode.",
                 resource.resource_id,
                 resource.source_system,
+                f" from cursor {resume_cursor}" if resume_cursor is not None else "",
+                config.ingest_mode,
             )
             (
+                checkpoint_state,
                 source_rows_examined,
                 successful_rows,
                 successful_batches,
@@ -830,6 +1153,8 @@ def run_ingestion_cycle(config: IngestionConfig, session: requests.Session) -> R
                 config.target_year,
                 config.batch_size,
                 config.max_records,
+                checkpoint_state,
+                config.checkpoint_path,
                 source_rows_examined,
                 successful_rows,
                 successful_batches,

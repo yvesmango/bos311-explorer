@@ -1,5 +1,5 @@
--- BOS311 Data Warehouse schema v1
--- Idempotent baseline schema for raw, normalized, and analytics-ready layers.
+-- BOS311 Explorer schema
+-- Canonical warehouse schema for raw, normalized, and audit tables.
 
 DROP FUNCTION IF EXISTS set_updated_at();
 
@@ -67,13 +67,27 @@ CREATE TABLE IF NOT EXISTS tickets (
     longitude DOUBLE PRECISION,
     geo_point GEOGRAPHY(POINT, 4326),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source_system VARCHAR NOT NULL DEFAULT 'legacy_boston_311',
+    case_topic TEXT,
+    service_name VARCHAR,
+    assigned_team VARCHAR,
+    closure_comments TEXT,
+    street_number VARCHAR,
+    full_street_address TEXT
 );
 
 COMMENT ON TABLE tickets IS 'Clean source-of-truth ticket records normalized from raw Boston 311 data.';
 COMMENT ON COLUMN tickets.geo_point IS 'PostGIS geography point built from latitude and longitude.';
 COMMENT ON COLUMN tickets.case_enquiry_id IS 'Natural key for upserts and lineage.';
 COMMENT ON COLUMN tickets.on_time IS 'Whether the request met its SLA target.';
+COMMENT ON COLUMN tickets.source_system IS 'Tracks whether the record originated from the legacy or new 311 system.';
+COMMENT ON COLUMN tickets.case_topic IS 'Abstracted issue title used for the citizen-facing story of the ticket.';
+COMMENT ON COLUMN tickets.service_name IS 'New-system service name.';
+COMMENT ON COLUMN tickets.assigned_team IS 'New-system team routing field.';
+COMMENT ON COLUMN tickets.closure_comments IS 'New-system closure notes.';
+COMMENT ON COLUMN tickets.street_number IS 'New-system street number field.';
+COMMENT ON COLUMN tickets.full_street_address IS 'New-system full location string.';
 
 CREATE TABLE IF NOT EXISTS ticket_status_history (
     id BIGSERIAL PRIMARY KEY,

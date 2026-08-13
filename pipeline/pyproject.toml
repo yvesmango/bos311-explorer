@@ -1,8 +1,7 @@
 [project]
-name = "bos311-datawarehouse"
+name = "bos311-explorer"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Boston 311 civic data pipeline for the BOS311 Explorer portfolio repo"
 requires-python = ">=3.12"
 dependencies = [
     "psycopg2-binary>=2.9.12",

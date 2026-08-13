@@ -1,7 +1,7 @@
 # Secrets
 .env
 
-# uv / Python
+# Python
 .venv/
 __pycache__/
 *.pyc
@@ -11,11 +11,6 @@ uv.lock
 # OS
 .DS_Store
 
-# Data (local test files only)
-data/*.csv
-
-# Metabase local state
-.metabase/
-metabase.db
-metabase.sqlite
-metabase.mv.db
+# Local data and runtime state
+data/
+.state/

@@ -1,87 +1,85 @@
-# BOS311 Data Warehouse
+# BOS311 Explorer
 
-Boston 311 civic data warehouse inspired by The Public Ledger.
+BOS311 Explorer is a compact Boston 311 civic data project that turns public service-request data into a clean, queryable warehouse and a Metabase-ready analytics layer.
 
-## What this is
+It is designed to be easy to read, easy to rebuild, and easy to explain to hiring managers in journalism and civic tech.
 
-This project turns Boston 311 service request data into a clean, queryable warehouse that can support both public-facing maps and analytics-ready datasets.
+## What it does
 
-## Current baseline
+- Ingests Boston 311 data from the City of Boston open data portal
+- Normalizes records across the legacy-to-new vendor transition
+- Keeps raw payloads for auditability and replay
+- Loads a clean warehouse schema for analytics and dashboarding
+- Supports a public-facing Metabase exploration workflow
 
-- Python project scaffolded with `uv`
-- Local secrets kept in `.env`
-- Git repository initialized locally on `main`
+## Repository layout
 
-## Schema migrations
-
-The repository keeps the database structure in two layers:
-
-1. [`sql/schema_v1.sql`](sql/schema_v1.sql) for the base warehouse schema
-2. [`sql/migrations/002_add_transition_columns.sql`](sql/migrations/002_add_transition_columns.sql) for the transition-era columns already applied in Supabase
-
-Apply the base schema first, then the migration, so the repo and the live
-database stay aligned:
-
-```bash
-psql "$DATABASE_URL" -f sql/schema_v1.sql
-psql "$DATABASE_URL" -f sql/migrations/002_add_transition_columns.sql
+```text
+bos311-explorer/
+├── README.md
+├── executive-summary.md
+├── .gitignore
+├── pipeline/
+│   ├── ingest_311.py
+│   └── pyproject.toml
+├── sql/
+│   └── schema.sql
+└── docs/
+    └── data_dictionary.md
 ```
 
-If you are working against the existing hosted Supabase project, those
-transition columns are already present in the live database. The migration file
-exists to make that state reproducible from source control and to keep future
-environments in sync.
+## Data model
 
-## Next milestones
+The warehouse uses a small, readable set of tables:
 
-1. Build the ingestion pipeline from the Boston CKAN API.
-2. Load data into PostgreSQL/Supabase.
-3. Stand up Metabase as the primary exploration layer.
+- `raw_311_tickets` for exact payload retention
+- `departments` and `categories` for lookup-based normalization
+- `tickets` for the clean source of truth
+- `ticket_status_history` for status-change auditing
 
-## Exploring with Metabase
+The schema keeps the important civic fields in one place:
 
-See [`docs/metabase-setup.md`](docs/metabase-setup.md) for the local Docker command,
-Supabase Session Pooler connection format, and the five starter questions in the
-"BOS311 Explorer" collection.
+- `open_dt`, `closed_dt`, and `sla_target_dt` for timelines
+- `case_status` and `on_time` for service performance
+- `latitude`, `longitude`, and `geo_point` for maps
+- `subject`, `description`, and `case_topic` for the human-readable story of each ticket
+- `source_system` for lineage across the vendor transition
 
-The warehouse remains the source of truth; Metabase is the read-only analysis
-surface for maps, charts, tables, and future embeds.
+## Pipeline
 
-## Ingestion
+The Python pipeline lives in `pipeline/ingest_311.py` and is managed with `uv`.
 
-The current pilot focuses on 2026 YTD only.
-
-Run the 2026 pilot ingestion with:
+From the repository root:
 
 ```bash
-uv run scripts/ingest_311.py
+cd pipeline
+uv run ingest_311.py
 ```
 
-For a smaller test run, cap the source rows traversed:
+Helpful environment variables:
 
-```bash
-INGESTION_MAX_RECORDS=1000 uv run scripts/ingest_311.py
-```
+- `DATABASE_URL` for the Supabase/PostgreSQL connection string
+- `CKAN_SQL_ENDPOINT` if the Boston open data endpoint changes
+- `INGESTION_TARGET_YEAR` to switch the load year
+- `INGESTION_BATCH_SIZE` to tune batch size
+- `INGESTION_MAX_RECORDS` for capped smoke tests
+- `INGESTION_MODE` for `incremental` or `backfill`
+- `INGESTION_CHECKPOINT_PATH` to move the local resume file
 
-To override the pilot year, set `INGESTION_TARGET_YEAR`, but we are keeping
-this project on 2026 until that slice is proven stable.
+The pipeline is idempotent and checkpoint-aware, so reruns resume from the last committed batch instead of replaying the entire source every time.
 
-The default batch size is `10000` rows. For larger future backfills, runtime
-will depend on network and Supabase performance.
+## Dashboard workflow
 
-The ingestion script reads from two Boston CKAN resource IDs during the
-transition:
+Metabase is the intended analysis layer for the repo.
 
-- Legacy resource: `1a0b420d-99f1-4887-9851-990b2a5a6e17`
-- New-system resource: `254adca6-64ab-4c5c-9fc0-a6da622be185`
+The warehouse is the source of truth; Metabase is the read-only surface for maps, charts, tables, and future sharing.
 
-Each resource is tagged with a fixed `source_system` value during ingest, so
-the translator does not need to guess which vendor produced a row.
+## Scope
 
-The fetcher uses keyset pagination plus retry/backoff so it is gentler on the
-CKAN source than deep `OFFSET` paging. If the source pushes back, the script
-will automatically shrink the batch size and keep moving forward.
+This repo is intentionally small:
 
-If an ingestion run is interrupted, simply rerun the script. The current design
-is idempotent thanks to `ON CONFLICT` upserts. A persisted resume marker is a
-future enhancement, not a requirement for correctness today.
+- no dashboard app source
+- no API layer
+- no extra infrastructure
+
+The point is to show a clean civic data engineering workflow, not a sprawling internal toolchain.
