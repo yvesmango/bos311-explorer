@@ -1,8 +1,5 @@
 # BOS311 Ingest Pipeline
 
-This is the public-facing Markdown rendering of the Boston 311 ingest pipeline. It keeps the same ETL logic as the Python source, but presents it in a readable document for GitHub Pages and hiring managers.
-
-## Full source
 
 This page is the public-facing render of the ingest pipeline. The code block below preserves the implementation in a readable, GitHub-friendly format.
 
