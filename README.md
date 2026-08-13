@@ -10,6 +10,7 @@ BOS311 Explorer is a compact Boston 311 civic data project that turns public ser
 - Keeps raw payloads for auditability and replay
 - Loads a clean warehouse schema for analytics and dashboarding
 - Supports a public-facing Metabase exploration workflow
+- Keeps the runnable ingest script in `pipeline/ingest_311.py`
 - Publishes the ingest pipeline as a Markdown walkthrough in `pipeline/ingest_311.md`
 
 
@@ -32,6 +33,21 @@ The pipeline ingests from both endpoints and merges them into a single, unified 
 ---
 
 ## Methodology
+
+## Local Run
+
+From the repository root:
+
+```bash
+cd pipeline
+caffeinate -d -- uv run ingest_311.py
+```
+
+If you prefer to stay at the repo root, use:
+
+```bash
+caffeinate -d -- uv run --project pipeline ingest_311.py
+```
 
 ### The Unified Civic Archive
 
