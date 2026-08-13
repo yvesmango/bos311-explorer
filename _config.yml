@@ -1,0 +1,21 @@
+remote_theme: vaibhavvikas/jekyll-theme-minimalistic
+color-scheme: light
+
+title: BOS311 Civic Data Explorer
+description: An automated pipeline and interactive dashboard tracking Boston's 311 service requests.
+
+
+plugins:
+  - jekyll-sitemap
+  - jekyll-seo-tag
+  - jemoji
+
+navigation:
+  - name: Read me
+    link: ./index.html
+  - name: Executive Summary
+    link: ./executive-summary
+  - name: Dashboard
+    link: ./dashboard
+  - name: Ingest Script
+    link: ./pipeline/ingest_311.py
