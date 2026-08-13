@@ -5,7 +5,7 @@ Explore Boston's 311 service request data through the interactive dashboard. Use
 <iframe
   src="https://mystic-birch.metabaseapp.com/public/dashboard/8515bf51-a787-4add-af0e-e4958405ceae"
   frameborder="0"
-  width="100%"
+  width="75%"
   height="1200"
   allowtransparency
 ></iframe>
