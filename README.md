@@ -13,7 +13,6 @@ BOS311 Explorer is a compact Boston 311 civic data project that turns public ser
 - Publishes the ingest pipeline as a Markdown walkthrough in `pipeline/ingest_311.md`
 
 
----
 
 ## Data Sources
 

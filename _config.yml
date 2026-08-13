@@ -11,11 +11,11 @@ plugins:
   - jemoji
 
 navigation:
-  - name: Read me
+  - name: Read Me
     link: ./README.md
   - name: Executive Summary
     link: ./executive-summary
   - name: Dashboard
     link: ./dashboard
   - name: Ingest Script
-    link: ./pipeline/ingest_311.md
+    link: ./pipeline/ingest_311
