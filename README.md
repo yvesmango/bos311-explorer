@@ -1,6 +1,6 @@
-# BOS311 Explorer
+# BOS311 Civic Data Explorer
 
-BOS311 Explorer is a compact Boston 311 civic data project that turns public service-request data into a clean, queryable warehouse and a Metabase-ready analytics layer.
+BOS311 Explorer is a compact Boston 311 civic data project that turns public service-request data from the City of Boston's open data portal into a clean, queryable warehouse and a Metabase-ready analytics layer.
 
 
 ## What it does
@@ -11,11 +11,6 @@ BOS311 Explorer is a compact Boston 311 civic data project that turns public ser
 - Loads a clean warehouse schema for analytics and dashboarding
 - Supports a public-facing Metabase exploration workflow
 - Publishes the ingest pipeline as a Markdown walkthrough in `pipeline/ingest_311.md`
-
-
-# BOS311 Civic Data Explorer
-
-This project turns Boston 311 service request data into a clean, queryable warehouse that can support both public-facing maps and analytics-ready datasets. It ingests live and historical service requests from the City of Boston's open data portal, normalizes them across a legacy-to-new system transition, and powers an interactive Metabase dashboard designed for editors, reporters, and civic readers.
 
 
 ---
