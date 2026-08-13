@@ -12,7 +12,7 @@ plugins:
 
 navigation:
   - name: Read Me
-    link: ./README.md
+    link: ./index.html
   - name: Executive Summary
     link: ./executive-summary
   - name: Dashboard
