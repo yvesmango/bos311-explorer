@@ -18,7 +18,14 @@ The project relies on a single public dataset maintained by the City of Boston t
 
 - **311 Service Requests** — every service request submitted by Boston residents, including issue type, location, timestamps, SLA targets, and closure details.
 
-During the current vendor transition, the city maintains two separate endpoints (legacy and new). The pipeline ingests from both and merges them into a unified warehouse so that users see a seamless historical view regardless of which system generated a ticket.
+During the current vendor transition, the city maintains **two distinct resource endpoints** under the same dataset umbrella:
+
+| Resource | Status |
+|---|---|
+| Legacy 311 system (`1a0b420d-...`) | Historical data through mid-2026 |
+| New 311 system (`254adca6-...`) | Live data as services migrate |
+
+The pipeline ingests from both endpoints and merges them into a single, unified warehouse so that users see a seamless historical view regardless of which vendor generated each ticket.
 
 ## Methodology
 
