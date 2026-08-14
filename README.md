@@ -4,7 +4,7 @@
 
 ## Introduction
 
-This project ingests 311 data from the City of Boston's open data portal, normalizes records across the city's vendor transition, and loads everything into a Supabase warehouse for analysis and dashboarding.
+This project ingests 311 data from the City of Boston's open data portal, normalizes records across the city's vendor transition, and loads everything into a Supabase warehouse for analysis and [dashboard](./dashboard).
 
 It's built for newsrooms, civic analysts, and curious residents who want to ask questions like:
 
