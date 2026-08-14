@@ -2,7 +2,7 @@
 
 **Goal**: To turn Boston's public 311 service request data into a clean, queryable warehouse that supports storyfinding, accountability journalism, and civic insight.
 
-## What It Does
+## Introduction
 
 This project ingests 311 data from the City of Boston's open data portal, normalizes records across the city's vendor transition, and loads everything into a Supabase warehouse for analysis and dashboarding.
 
